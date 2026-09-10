@@ -1,240 +1,283 @@
-import time
-from datetime import datetime
-import openpyxl
-import pandas as pd
-import pyvisa
+"""
+TEST DE FRECUENCIA DE LA RED CON WT3000
+========================================
+Objetivo: Medir la frecuencia de la tensión de red con el WT3000
+en modo rápido para obtener estadísticas detalladas.
+Configuración optimizada para máxima velocidad de muestreo.
+"""
 
-def parse_float(val_str):
-    """Convierte cadenas a float, manejando valores de fuera de rango u 'OVER' típicos de analizadores."""
-    try:
-        val = float(val_str)
-        # Los analizadores Yokogawa suelen entregar valores como 9.9E37 cuando hay sobreescala
-        if val > 1e30 or val < -1e30:
+import time
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from datetime import datetime
+import pyvisa
+import os
+
+from controllers.wt3000controller import YokogawaWT3000
+
+# ==============================================================================
+# CONFIGURACIÓN
+# ==============================================================================
+
+DIR_WT = "GPIB0::1::INSTR"          # Dirección del WT3000
+NUM_MUESTRAS = 1000                 # Número de muestras a tomar
+INTERVALO_MUESTREO = 0.02           # Segundos entre lecturas (20 ms)
+TIMEOUT = 5000                      # Timeout en ms (5 s)
+
+# ==============================================================================
+# CLASE EXTENDIDA PARA LECTURA RÁPIDA DE FRECUENCIA
+# ==============================================================================
+
+class WT3000FastFrequency(YokogawaWT3000):
+    """
+    Extiende YokogawaWT3000 para añadir un método de lectura rápida de frecuencia.
+    """
+    def configurar_solo_frecuencia(self, elemento=1):
+        """
+        Configura el WT3000 para medir solo la frecuencia del elemento especificado.
+        Esto reduce el tiempo de transferencia de datos.
+        """
+        self.escribir(":NUMeric:FORMAT ASCII")
+        self.escribir(":NUMeric:NUMBER 1")
+        self.escribir(f":NUMeric:ITEM1 FU,{elemento}")  # Frecuencia de tensión
+        # Forzar actualización
+        self.escribir(":INITiate:CONTinuous ON")
+        time.sleep(0.1)
+
+    def leer_frecuencia(self) -> float:
+        """
+        Lee solo la frecuencia de la tensión de red (valor numérico).
+        Retorna None si hay error.
+        """
+        try:
+            # Consultar el primer (y único) valor numérico
+            respuesta = self.consultar(":NUMeric:VALue?")
+            partes = respuesta.strip().split(',')
+            if len(partes) >= 1:
+                val = float(partes[0])
+                # Verificar sobreescala
+                if abs(val) > 1e30:
+                    return None
+                return val
             return None
-        return val
-    except ValueError:
-        return None
-    
-def exportar_a_excel(datos, nombre_archivo):
-    """Genera un archivo Excel con formato profesional a partir de los datos recolectados."""
+        except Exception:
+            return None
+
+# ==============================================================================
+# FUNCIONES AUXILIARES
+# ==============================================================================
+
+def mostrar_estadisticas(datos):
+    """Calcula y muestra estadísticas básicas."""
     if not datos:
-        print("No se registraron datos para exportar.")
+        print("No hay datos para analizar.")
         return
 
-    df = pd.DataFrame(datos)
+    arr = np.array(datos)
+    media = np.mean(arr)
+    desv = np.std(arr)
+    minimo = np.min(arr)
+    maximo = np.max(arr)
+    p95 = np.percentile(arr, 95)
+    p99 = np.percentile(arr, 99)
+    rango = maximo - minimo
 
-    # Crear el escritor de Excel con openpyxl
-    with pd.ExcelWriter(nombre_archivo, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Lecturas", index=False)
+    print("\n" + "=" * 80)
+    print(" ESTADÍSTICAS DE FRECUENCIA DE LA RED")
+    print("=" * 80)
+    print(f" Número de muestras:       {len(datos)}")
+    print(f" Frecuencia media:         {media:.6f} Hz")
+    print(f" Desviación estándar:      {desv:.6f} Hz")
+    print(f" Frecuencia mínima:        {minimo:.6f} Hz")
+    print(f" Frecuencia máxima:        {maximo:.6f} Hz")
+    print(f" Rango (pico a pico):      {rango:.6f} Hz")
+    print(f" Percentil 95:             {p95:.6f} Hz")
+    print(f" Percentil 99:             {p99:.6f} Hz")
+    print(f" Desviación relativa:      {(desv/media*100):.4f} %")
+    print("=" * 80)
 
-        # Acceder al libro y hoja de trabajo para aplicar formato
-        workbook = writer.book
-        worksheet = writer.sheets["Lecturas"]
+    return {
+        "media": media,
+        "desviacion": desv,
+        "minimo": minimo,
+        "maximo": maximo,
+        "rango": rango,
+        "p95": p95,
+        "p99": p99,
+        "desv_relativa": desv/media*100
+    }
 
-        # Estilos visuales
-        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+def exportar_excel(datos, estadisticas, filename=None):
+    """Exporta los datos y estadísticas a un archivo Excel."""
+    if filename is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"frecuencia_red_{timestamp}.xlsx"
 
-        header_fill = PatternFill(
-            start_color="1F4E78", end_color="1F4E78", fill_type="solid"
-        )
-        header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
-        data_font = Font(name="Calibri", size=10)
+    # Crear DataFrame con las muestras
+    df_datos = pd.DataFrame({
+        "Muestra": range(1, len(datos)+1),
+        "Frecuencia_Hz": datos,
+        "Tiempo_s": np.arange(0, len(datos)*INTERVALO_MUESTREO, INTERVALO_MUESTREO)[:len(datos)]
+    })
 
-        thin_border = Border(
-            left=Side(style="thin", color="D9D9D9"),
-            right=Side(style="thin", color="D9D9D9"),
-            top=Side(style="thin", color="D9D9D9"),
-            bottom=Side(style="thin", color="D9D9D9"),
-        )
+    # Crear DataFrame con estadísticas
+    df_stats = pd.DataFrame([estadisticas])
 
-        # Formatear Encabezados
-        for col_num, col_name in enumerate(df.columns, 1):
-            cell = worksheet.cell(row=1, column=col_num)
-            cell.fill = header_fill
-            cell.font = header_font
-            cell.alignment = Alignment(
-                horizontal="center", vertical="center", wrap_text=True
-            )
+    # Escribir a Excel con dos hojas
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df_datos.to_excel(writer, sheet_name='Muestras', index=False)
+        df_stats.to_excel(writer, sheet_name='Estadisticas', index=False)
 
-        # Formatear Celdas de Datos
-        for row in range(2, len(df) + 2):
-            for col in range(1, len(df.columns) + 1):
-                cell = worksheet.cell(row=row, column=col)
-                cell.font = data_font
-                cell.border = thin_border
-                cell.alignment = Alignment(vertical="center")
+    print(f"\n✓ Datos exportados a: {filename}")
+    return filename
 
-                # Formatos numéricos específicos por columna
-                col_title = df.columns[col - 1]
-                if "Tiempo" in col_title:
-                    cell.alignment = Alignment(horizontal="center")
-                elif any(
-                    k in col_title
-                    for k in ["Voltaje", "Corriente", "Frecuencia"]
-                ):
-                    cell.number_format = "0.0000"
-                    cell.alignment = Alignment(horizontal="right")
-                elif any(k in col_title for k in ["Potencia", "Ángulo"]):
-                    cell.number_format = "0.00"
-                    cell.alignment = Alignment(horizontal="right")
-                elif "Factor" in col_title:
-                    cell.number_format = "0.000"
-                    cell.alignment = Alignment(horizontal="right")
+def graficar_datos(datos, estadisticas, guardar=True):
+    """Genera gráficas de la evolución temporal y el histograma."""
+    if not datos:
+        return
 
-        # Agregar filas de resumen estadístico (Promedio, Mínimo, Máximo)
-        last_data_row = len(df) + 1
-        stats = [("Promedio", "AVERAGE"), ("Mínimo", "MIN"), ("Máximo", "MAX")]
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
 
-        stat_font = Font(name="Calibri", size=10, bold=True)
-        stat_fill = PatternFill(
-            start_color="F2F2F2", end_color="F2F2F2", fill_type="solid"
-        )
+    # Gráfica temporal
+    tiempo = np.arange(0, len(datos)*INTERVALO_MUESTREO, INTERVALO_MUESTREO)[:len(datos)]
+    ax1.plot(tiempo, datos, 'b-', linewidth=0.8, alpha=0.7)
+    ax1.axhline(y=estadisticas["media"], color='r', linestyle='--', label=f'Media: {estadisticas["media"]:.6f} Hz')
+    ax1.fill_between(tiempo, 
+                     estadisticas["media"] - estadisticas["desviacion"], 
+                     estadisticas["media"] + estadisticas["desviacion"], 
+                     color='gray', alpha=0.2, label=f'±1σ ({estadisticas["desviacion"]:.6f} Hz)')
+    ax1.set_xlabel('Tiempo (s)')
+    ax1.set_ylabel('Frecuencia (Hz)')
+    ax1.set_title('Evolución temporal de la frecuencia de la red')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
 
-        for idx, (label, func) in enumerate(stats, start=1):
-            stat_row = last_data_row + idx
-            # Etiqueta en la primera columna
-            cell_label = worksheet.cell(row=stat_row, column=1, value=label)
-            cell_label.font = stat_font
-            cell_label.fill = stat_fill
+    # Histograma
+    ax2.hist(datos, bins=30, color='skyblue', edgecolor='black', alpha=0.7)
+    ax2.axvline(x=estadisticas["media"], color='r', linestyle='--', label=f'Media: {estadisticas["media"]:.6f} Hz')
+    ax2.axvline(x=estadisticas["media"] - estadisticas["desviacion"], color='gray', linestyle=':', label=f'-1σ')
+    ax2.axvline(x=estadisticas["media"] + estadisticas["desviacion"], color='gray', linestyle=':', label=f'+1σ')
+    ax2.set_xlabel('Frecuencia (Hz)')
+    ax2.set_ylabel('Frecuencia absoluta')
+    ax2.set_title('Distribución de la frecuencia de la red')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
 
-            # Fórmulas para las columnas numéricas
-            for col in range(2, len(df.columns) + 1):
-                col_letter = openpyxl.utils.get_column_letter(col)
-                formula = (
-                    f"={func}({col_letter}2:{col_letter}{last_data_row})"
-                )
-                cell_stat = worksheet.cell(
-                    row=stat_row, column=col, value=formula
-                )
-                cell_stat.font = stat_font
-                cell_stat.fill = stat_fill
-                cell_stat.border = thin_border
-                cell_stat.alignment = Alignment(horizontal="right")
+    plt.tight_layout()
 
-        # Auto-ajustar ancho de columnas
-        for col in worksheet.columns:
-            max_len = max(len(str(cell.value or "")) for cell in col)
-            col_letter = openpyxl.utils.get_column_letter(col[0].column)
-            worksheet.column_dimensions[col_letter].width = max(max_len + 3, 12)
+    if guardar:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"frecuencia_red_grafica_{timestamp}.png"
+        plt.savefig(filename, dpi=150, bbox_inches='tight')
+        print(f"✓ Gráfica guardada como: {filename}")
 
-    print(f"\n[✔] Reporte guardado exitosamente en: {nombre_archivo}")
+    plt.show()
+
+# ==============================================================================
+# FUNCIÓN PRINCIPAL
+# ==============================================================================
 
 def main():
-    rm = pyvisa.ResourceManager()
+    print("\n" + "=" * 90)
+    print(" TEST DE FRECUENCIA DE LA RED CON WT3000")
+    print(" ========================================")
+    print(f" Modo: Ultrarrápido (lectura optimizada)")
+    print(f" Número de muestras: {NUM_MUESTRAS}")
+    print(f" Intervalo de muestreo: {INTERVALO_MUESTREO*1000:.1f} ms")
+    print("=" * 90)
 
-    # Cambia esta dirección según la configuración de tu equipo en NI MAX
-    resource_name = "GPIB1::1::INSTR"
-
-    # Lista para almacenar las lecturas
-    registros = []
+    # Inicializar controlador en modo 'fast' (ya está optimizado)
+    wt = WT3000FastFrequency(DIR_WT, mode='fast', timeout=TIMEOUT)
 
     try:
-        inst = rm.open_resource(resource_name)
-        inst.timeout = 5000  # 5 segundos
-        inst.write_termination = "\n"
-        inst.read_termination = "\n"
+        # ---------- Conexión y configuración ----------
+        print("\n[1/3] Conectando al WT3000...")
+        wt.conectar()
+        print("  ✓ WT3000 conectado")
 
-        # Verificar identificación del equipo
-        idn = inst.query("*IDN?")
-        print(f"Conectado a: {idn.strip()}")
+        print("\n[2/3] Configurando modo rápido (solo frecuencia)...")
+        wt.configurar_solo_frecuencia(elemento=1)
+        print("  ✓ Configuración aplicada")
 
-        # Configuración del formato de salida en el analizador
-        inst.write(":NUMeric:FORMAT ASCII")
-        inst.write(":NUMeric:NUMBER 12")  # Indicar que se enviarán 12 ítems
+        print("\n[3/3] Iniciando muestreo...")
+        print(f"  Tomando {NUM_MUESTRAS} muestras cada {INTERVALO_MUESTREO*1000:.1f} ms...")
+        print("  (Presiona Ctrl+C para interrumpir)")
 
-        # Configuración de los 12 elementos de medición
-        inst.write(":NUMeric:ITEM1 U,1")  # Voltaje RMS (V)
-        inst.write(":NUMeric:ITEM2 UMN,1")  # Voltaje Medio (V)
-        inst.write(":NUMeric:ITEM3 UDC,1")  # Voltaje DC (V)
-        inst.write(":NUMeric:ITEM4 I,1")  # Corriente RMS (A)
-        inst.write(":NUMeric:ITEM5 IMN,1")  # Corriente Media (A)
-        inst.write(":NUMeric:ITEM6 IDC,1")  # Corriente DC (A)
-        inst.write(":NUMeric:ITEM7 P,1")  # Potencia Activa (W)
-        inst.write(":NUMeric:ITEM8 S,1")  # Potencia Aparente (VA)
-        inst.write(":NUMeric:ITEM9 Q,1")  # Potencia Reactiva (VAR)
-        inst.write(":NUMeric:ITEM10 LAMBda,1")  # Factor de Potencia (PF)
-        inst.write(":NUMeric:ITEM11 PHI,1")  # Ángulo de Fase (deg)
-        inst.write(":NUMeric:ITEM12 FU,1")  # Frecuencia de Voltaje (Hz)
+        # ---------- Toma de muestras ----------
+        muestras = []
+        tiempos = []
+        errores = 0
 
-        print(
-            "\n--- Iniciando adquisición de datos (Presiona Ctrl+C para finalizar y guardar) ---"
-        )
-        print(
-            f"{'Tiempo':<10} | {'V RMS (V)':<10} | {'I RMS (A)':<10} | {'P Activa (W)':<12} | {'F.P.':<8} | {'Frec (Hz)':<10}"
-        )
-        print("-" * 70)
+        inicio = time.time()
+        for i in range(NUM_MUESTRAS):
+            t_inicio = time.time()
+            freq = wt.leer_frecuencia()
+            if freq is not None:
+                muestras.append(freq)
+                tiempos.append(t_inicio - inicio)
+            else:
+                errores += 1
 
-        while True:
-            t_actual = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-            data_raw = inst.query(":NUMeric:VALue?")
-            values = data_raw.strip().split(",")
+            # Mostrar progreso cada 100 muestras
+            if (i+1) % 100 == 0:
+                print(f"  Progreso: {i+1}/{NUM_MUESTRAS} muestras (errores: {errores})")
 
-            if len(values) >= 12:
-                # Extracción y conversión de los 12 datos configurados
-                u_rms = parse_float(values[0])
-                u_mn = parse_float(values[1])
-                u_dc = parse_float(values[2])
-                i_rms = parse_float(values[3])
-                i_mn = parse_float(values[4])
-                i_dc = parse_float(values[5])
-                p_activa = parse_float(values[6])
-                s_aparente = parse_float(values[7])
-                q_reactiva = parse_float(values[8])
-                pf = parse_float(values[9])
-                phi = parse_float(values[10])
-                frec = parse_float(values[11])
+            # Esperar hasta el siguiente intervalo
+            tiempo_espera = max(0, INTERVALO_MUESTREO - (time.time() - t_inicio))
+            time.sleep(tiempo_espera)
 
-                # Guardar registro en la lista
-                registros.append(
-                    {
-                        "Tiempo": t_actual,
-                        "Voltaje RMS (V)": u_rms,
-                        "Voltaje Medio (V)": u_mn,
-                        "Voltaje DC (V)": u_dc,
-                        "Corriente RMS (A)": i_rms,
-                        "Corriente Media (A)": i_mn,
-                        "Corriente DC (A)": i_dc,
-                        "Potencia Activa (W)": p_activa,
-                        "Potencia Aparente (VA)": s_aparente,
-                        "Potencia Reactiva (VAR)": q_reactiva,
-                        "Factor de Potencia": pf,
-                        "Ángulo de Fase (°)": phi,
-                        "Frecuencia (Hz)": frec,
-                    }
-                )
+        duracion_total = time.time() - inicio
 
-                # Mostrar valores principales en consola
-                v_str = f"{u_rms:10.4f}" if u_rms is not None else "      OVER"
-                i_str = f"{i_rms:10.4f}" if i_rms is not None else "      OVER"
-                p_str = (
-                    f"{p_activa:12.4f}" if p_activa is not None else "        OVER"
-                )
-                pf_str = f"{pf:8.4f}" if pf is not None else "    OVER"
-                f_str = f"{frec:10.4f}" if frec is not None else "      OVER"
+        print(f"\n✓ Muestreo completado en {duracion_total:.2f} s")
+        print(f"  Muestras válidas: {len(muestras)}")
+        print(f"  Errores: {errores}")
 
-                print(
-                    f"{t_actual:<10} | {v_str} | {i_str} | {p_str} | {pf_str} | {f_str}"
-                )
+        if len(muestras) == 0:
+            print("  ✗ No se obtuvieron muestras válidas.")
+            return
 
-            time.sleep(0.5)
+        # ---------- Análisis estadístico ----------
+        estadisticas = mostrar_estadisticas(muestras)
 
-    except pyvisa.VisaIOError as e:
-        print(f"\n[X] Error de comunicación GPIB: {e}")
+        # ---------- Exportación a Excel ----------
+        archivo_excel = exportar_excel(muestras, estadisticas)
+
+        # ---------- Gráficas ----------
+        print("\nGenerando gráficas...")
+        graficar_datos(muestras, estadisticas)
+
+        # ---------- Resumen final ----------
+        print("\n" + "=" * 90)
+        print(" RESUMEN DE LA PRUEBA")
+        print("=" * 90)
+        print(f" Duración total:          {duracion_total:.2f} s")
+        print(f" Muestras tomadas:        {len(muestras)}")
+        print(f" Tasa de muestreo:        {len(muestras)/duracion_total:.1f} muestras/s")
+        print(f" Frecuencia media:        {estadisticas['media']:.6f} Hz")
+        print(f" Desviación estándar:     {estadisticas['desviacion']:.6f} Hz")
+        print(f" Archivo Excel generado:  {archivo_excel}")
+        print("=" * 90)
+
     except KeyboardInterrupt:
-        print("\n[!] Adquisición detenida por el usuario.")
+        print("\n\n[!] Prueba cancelada por el usuario.")
+        if muestras:
+            print(f"  Se tomaron {len(muestras)} muestras antes de la interrupción.")
+            estadisticas = mostrar_estadisticas(muestras)
+            exportar_excel(muestras, estadisticas, f"frecuencia_red_interrumpido_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    except Exception as e:
+        print(f"\n[X] Error fatal: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
-        # Cerrar conexión GPIB
-        if "inst" in locals():
-            inst.close()
-        rm.close()
-
-        # Generar reporte Excel si se capturaron datos
-        if registros:
-            nombre_reporte = (
-                f"Reporte_WT3000_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
-            exportar_a_excel(registros, nombre_reporte)
-
+        print("\n[!] Cerrando conexión...")
+        if wt:
+            try:
+                wt.desconectar()
+                print("  ✓ WT3000 desconectado")
+            except Exception as e:
+                print(f"  ✗ Error al desconectar: {e}")
+        print("[✓] Prueba finalizada")
 
 if __name__ == "__main__":
     main()

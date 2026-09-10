@@ -1,23 +1,23 @@
 """
-SISTEMA DE CONTROL DE FP - VERSIÓN CON OFFSET DE FRECUENCIA
-============================================================
-Estrategia: Usar offset de frecuencia para controlar la fase
-El offset crea un desfase acumulativo de forma estable
+SISTEMA DE CONTROL DE FP - MEJORADO (CONTROL PI ADAPTATIVO DE FASE)
+=====================================================================
+Optimizado para convergencia rápida a FP = 1.0 con anti-windup,
+detección de polaridad y búsqueda de rescate.
 """
 
 import time
 import numpy as np
-from collections import deque
 from datetime import datetime
-import pyvisa
-from wtcontroller import YokogawaWT3000
+
+from controllers.fg420controller import YokogawaFG420
+from controllers.wt3000controller import YokogawaWT3000
 
 # ==============================================================================
-# CONFIGURACIÓN
+# CONFIGURACIÓN GENERAL
 # ==============================================================================
 
-GPIB_YOKOGAWA_WT = "GPIB0::1::INSTR"
-GPIB_YOKOGAWA_FG = "GPIB1::2::INSTR"
+DIR_FG = "GPIB1::2::INSTR"
+DIR_WT = "GPIB0::1::INSTR"
 
 ELEMENTO_WT = 1
 TIEMPO_PRUEBA_SEG = 300
@@ -27,384 +27,308 @@ FP_OBJETIVO = 1.0
 MARGEN_FP_MIN = 0.970
 MARGEN_FP_MAX = 1.030
 
-# Límites del FG420
-AMPLITUD_MIN = 0.5
+AMPLITUD_MIN = 2.0
 AMPLITUD_MAX = 10.0
 AMPLITUD_INICIAL = 5.0
 
-# Límites de offset de frecuencia (Hz)
-OFFSET_MIN = -0.5
-OFFSET_MAX = 0.5
-OFFSET_INICIAL = 0.0
-
-# Límites de frecuencia (Hz)
-FREC_MIN = 59.0
-FREC_MAX = 61.0
-
-# Parámetros PID para offset de frecuencia
-KP_OFFSET = 0.08      # Ganancia proporcional
-KI_OFFSET = 0.01      # Ganancia integral
-KD_OFFSET = 0.10      # Ganancia derivativa
-
-# Umbrales
-DEADBAND_FP = 0.005
+FASE_MIN = -180.0
+FASE_MAX = 180.0
 
 # ==============================================================================
-# CLASE CONTROLADOR CON OFFSET DE FRECUENCIA
+# PARÁMETROS OPTIMIZADOS DEL CONTROLADOR
 # ==============================================================================
 
-class ControladorOffsetFrecuencia:
-    """
-    Controlador que usa offset de frecuencia para ajustar la fase
-    """
+KP_FASE = 0.45            # Ganancia Proporcional base
+KI_FASE = 0.08            # Ganancia Integral (elimina error estacionario)
+FILTRO_PHI = 0.35         # Filtro más rápido (menor retardo de fase)
+DEADBAND_PHI = 0.15       # Umbral fino de zona muerta en grados
+
+# ==============================================================================
+# CLASE CONTROLADOR PI ADAPTATIVO
+# ==============================================================================
+
+class ControladorFaseAvanzado:
     def __init__(self):
-        # Buffers
-        self.buffer_fp = deque(maxlen=15)
-        self.buffer_frec_red = deque(maxlen=8)
-        
-        # Estado
-        self.fp_suavizado = 1.0
-        self.frecuencia_red = 60.0
-        self.frecuencia_fg = 60.0
-        self.offset_actual = 0.0
+        self.fase_actual = 0.0
         self.amplitud_actual = AMPLITUD_INICIAL
-        
-        # Memoria del mejor punto
+        self.phi_suavizado = 0.0
+        self.fp_suavizado = 1.0
+
+        # Término integral
+        self.integral_error = 0.0
+
+        # Mejor punto histórico (Rescate)
         self.mejor_fp = 0.0
-        self.mejor_offset = 0.0
-        self.conteo_estable = 0
-        
-        # PID para offset
-        self.integral_offset = 0.0
-        self.last_error = 0.0
-        self.last_fp = 1.0
-        
-    def actualizar(self, fp_medido, frec_red_medida, dt):
-        """
-        Actualiza el controlador usando offset de frecuencia
-        """
-        # 1. Suavizar FP
-        if fp_medido is not None and abs(fp_medido) < 2.0:
-            fp_abs = abs(fp_medido)
-            self.buffer_fp.append(fp_abs)
-            if len(self.buffer_fp) >= 3:
-                self.fp_suavizado = np.mean(self.buffer_fp)
-            else:
-                self.fp_suavizado = fp_abs
-        
-        # 2. Suavizar frecuencia de la red
-        if frec_red_medida is not None and frec_red_medida > 10:
-            self.buffer_frec_red.append(frec_red_medida)
-            if len(self.buffer_frec_red) >= 3:
-                frec_prom = np.mean(self.buffer_frec_red)
-                self.frecuencia_red = (frec_prom * 0.3 + 
-                                       self.frecuencia_red * 0.7)
-        
-        # 3. Calcular error
-        error_fp = FP_OBJETIVO - self.fp_suavizado
-        
-        # 4. Actualizar mejor punto
-        if self.fp_suavizado > self.mejor_fp and self.fp_suavizado < 1.1:
+        self.mejor_fase = 0.0
+        self.mejor_amplitud = AMPLITUD_INICIAL
+
+        # Detección de divergencia y saturación
+        self.contador_saturado = 0
+        self.polaridad = 1.0  # Multiplicador de dirección de corrección
+
+    def actualizar(self, fp_medido, phi_medido, dt):
+        # 1. Filtrado dinámico
+        if phi_medido is not None and abs(phi_medido) <= 180:
+            self.phi_suavizado = (1 - FILTRO_PHI) * self.phi_suavizado + FILTRO_PHI * phi_medido
+        if fp_medido is not None and abs(fp_medido) <= 2.0:
+            self.fp_suavizado = (1 - FILTRO_PHI) * self.fp_suavizado + FILTRO_PHI * abs(fp_medido)
+
+        # 2. Registrar mejor desempeño
+        if self.fp_suavizado > self.mejor_fp and self.fp_suavizado <= 1.05:
             self.mejor_fp = self.fp_suavizado
-            self.mejor_offset = self.offset_actual
-            self.conteo_estable = 0
+            self.mejor_fase = self.fase_actual
+            self.mejor_amplitud = self.amplitud_actual
+
+        # 3. Lógica de rescate ante saturación o colapso de FP
+        if abs(self.fase_actual) >= (FASE_MAX - 1.0) or self.fp_suavizado < 0.35:
+            self.contador_saturado += 1
+            if self.contador_saturado > 4:
+                # Regresar a la mejor fase conocida e invertir polaridad de control
+                self.fase_actual = self.mejor_fase
+                self.integral_error = 0.0
+                self.polaridad *= -1.0
+                self.contador_saturado = 0
+                return {
+                    "fase_fg": self.fase_actual,
+                    "amplitud": self.amplitud_actual,
+                    "phi_suavizado": self.phi_suavizado,
+                    "fp_suavizado": self.fp_suavizado,
+                    "error_phi": 0.0,
+                    "correccion": 0.0,
+                    "cambio": True,
+                    "mejor_fp": self.mejor_fp,
+                    "mejor_fase": self.mejor_fase,
+                    "mejor_amplitud": self.mejor_amplitud,
+                    "saturado": True,
+                    "accion": "RESCATE_FASE"
+                }
         else:
-            self.conteo_estable += 1
-        
-        # 5. Deadband
-        if abs(error_fp) < DEADBAND_FP:
+            self.contador_saturado = 0
+
+        # 4. Cálculo del error (Objetivo: phi -> 0)
+        error_phi = self.phi_suavizado * self.polaridad
+
+        if abs(error_phi) < DEADBAND_PHI:
             return self._respuesta_sin_cambio()
-        
-        # 6. PID para offset (signo invertido para dirección correcta)
-        p_term = -KP_OFFSET * error_fp * 10
-        
-        # Integral (limitada)
-        if abs(error_fp) < 0.1:
-            self.integral_offset += error_fp * dt * 5
-            self.integral_offset = max(-0.1, min(0.1, self.integral_offset))
+
+        # 5. Adaptatividad de paso según la magnitud del problema
+        abs_err = abs(error_phi)
+        if abs_err > 20.0:
+            paso_max = 5.0
+            kp_adj = KP_FASE * 1.5
+        elif abs_err > 5.0:
+            paso_max = 2.0
+            kp_adj = KP_FASE
         else:
-            self.integral_offset = 0.0
-        i_term = -KI_OFFSET * self.integral_offset
-        
-        # Derivativo
-        d_term = 0.0
-        if dt > 0.001 and len(self.buffer_fp) > 2:
-            cambio_fp = self.fp_suavizado - self.last_fp
-            d_term = -KD_OFFSET * cambio_fp / (dt + 0.001) * 5
-        
-        # Acción total
-        accion_offset = p_term + i_term + d_term
-        
-        # Limitar cambio de offset
-        cambio_max = 0.02 * dt
-        accion_offset = max(-cambio_max, min(cambio_max, accion_offset))
-        
-        # Si la acción es muy pequeña, no hacer nada
-        if abs(accion_offset) < 0.0005:
+            paso_max = 0.5
+            kp_adj = KP_FASE * 0.7
+
+        # 6. Cálculo PI
+        self.integral_error += error_phi * dt
+        # Limitar viento del acumulador integral (Anti-windup)
+        self.integral_error = max(-20.0, min(20.0, self.integral_error))
+
+        p_term = kp_adj * error_phi
+        i_term = KI_FASE * self.integral_error
+
+        correccion = p_term + i_term
+        correccion = max(-paso_max, min(paso_max, correccion))
+
+        nueva_fase = self.fase_actual - correccion
+        nueva_fase = max(FASE_MIN, min(FASE_MAX, nueva_fase))
+
+        if abs(nueva_fase - self.fase_actual) < 0.02:
             return self._respuesta_sin_cambio()
-        
-        # Aplicar cambio
-        nuevo_offset = self.offset_actual + accion_offset
-        nuevo_offset = max(OFFSET_MIN, min(OFFSET_MAX, nuevo_offset))
-        
-        self.last_error = error_fp
-        self.last_fp = self.fp_suavizado
-        
-        # 7. Calcular frecuencia del FG
-        frecuencia_fg = self.frecuencia_red + nuevo_offset
-        frecuencia_fg = max(FREC_MIN, min(FREC_MAX, frecuencia_fg))
-        
-        if abs(frecuencia_fg - self.frecuencia_fg) > 0.0005:
-            self.frecuencia_fg = frecuencia_fg
-            self.offset_actual = nuevo_offset
-            
-            return {
-                "amplitud": self.amplitud_actual,
-                "frecuencia_fg": frecuencia_fg,
-                "frecuencia_red": self.frecuencia_red,
-                "offset": nuevo_offset,
-                "fp": self.fp_suavizado,
-                "error_fp": error_fp,
-                "accion": f"OFF_{accion_offset:+.4f}",
-                "cambio": True,
-                "mejor_fp": self.mejor_fp,
-                "mejor_offset": self.mejor_offset
-            }
-        
-        return self._respuesta_sin_cambio()
-    
+
+        self.fase_actual = nueva_fase
+
+        return {
+            "fase_fg": self.fase_actual,
+            "amplitud": self.amplitud_actual,
+            "phi_suavizado": self.phi_suavizado,
+            "fp_suavizado": self.fp_suavizado,
+            "error_phi": error_phi,
+            "correccion": correccion,
+            "cambio": True,
+            "mejor_fp": self.mejor_fp,
+            "mejor_fase": self.mejor_fase,
+            "mejor_amplitud": self.mejor_amplitud,
+            "saturado": False,
+            "accion": f"FASE_{correccion:+.2f}"
+        }
+
     def _respuesta_sin_cambio(self):
         return {
+            "fase_fg": self.fase_actual,
             "amplitud": self.amplitud_actual,
-            "frecuencia_fg": self.frecuencia_fg,
-            "frecuencia_red": self.frecuencia_red,
-            "offset": self.offset_actual,
-            "fp": self.fp_suavizado,
-            "error_fp": 0,
-            "accion": "SIN_CAMBIO",
+            "phi_suavizado": self.phi_suavizado,
+            "fp_suavizado": self.fp_suavizado,
+            "error_phi": 0,
+            "correccion": 0,
             "cambio": False,
             "mejor_fp": self.mejor_fp,
-            "mejor_offset": self.mejor_offset
+            "mejor_fase": self.mejor_fase,
+            "mejor_amplitud": self.mejor_amplitud,
+            "saturado": False,
+            "accion": "ESTABLE"
         }
 
 # ==============================================================================
-# FUNCIONES PARA FG420
+# FUNCIÓN DE ESTADÍSTICAS
 # ==============================================================================
 
-def configurar_fg420_offset(fg_inst, frecuencia, amplitud):
-    """Configura el FG420 con frecuencia y amplitud"""
-    try:
-        fg_inst.clear()
-        time.sleep(0.05)
-        
-        fg_inst.write_termination = '\n'
-        fg_inst.read_termination = '\n'
-        fg_inst.timeout = 5000
-        
-        # Forma de onda sinusoidal
-        fg_inst.write(":SOURce1:FUNCtion:SHAPe SIN")
-        time.sleep(0.02)
-        
-        # Frecuencia
-        fg_inst.write(f":SOURce1:FREQuency {frecuencia:.6f}HZ")
-        time.sleep(0.02)
-        
-        # Amplitud
-        fg_inst.write(f":SOURce1:VOLTage:AMPLitude {amplitud:.3f}V")
-        time.sleep(0.02)
-        
-        # Carga
-        try:
-            fg_inst.write(":OUTPut1:LOAD INF")
-            time.sleep(0.02)
-        except:
-            pass
-        
-        # Activar salida
-        fg_inst.write(":OUTPut1:STATe ON")
-        time.sleep(0.05)
-        
-        return True
-    except Exception as e:
-        print(f"  ✗ Error configurando FG420: {e}")
-        return False
+def mostrar_resumen(controlador, metodo_directo, total_iteraciones, iteraciones_en_rango,
+                    fp_historico, tiempo_total=None):
+    efectividad = (iteraciones_en_rango / total_iteraciones * 100) if total_iteraciones > 0 else 0
 
-def actualizar_fg420_offset(fg_inst, frecuencia, amplitud):
-    """Actualiza frecuencia y amplitud del FG420"""
-    try:
-        fg_inst.write(f":SOURce1:FREQuency {frecuencia:.6f}HZ")
-        time.sleep(0.01)
-        
-        fg_inst.write(f":SOURce1:VOLTage:AMPLitude {amplitud:.3f}V")
-        time.sleep(0.01)
-        
-        return True
-    except Exception as e:
-        print(f"  ✗ Error actualizando FG420: {e}")
-        return False
+    print("\n" + "=" * 90)
+    print(" RESUMEN FINAL DE PRUEBA")
+    print("=" * 90)
+    if tiempo_total is not None:
+        print(f" Tiempo total de prueba:      {tiempo_total:.1f} s")
+    print(f" Total iteraciones:           {total_iteraciones}")
+    print(f" En rango (1±3%):             {iteraciones_en_rango}")
+    print(f" Efectividad:                 {efectividad:.2f}%")
+    if fp_historico:
+        ultimas = fp_historico[-50:] if len(fp_historico) >= 50 else fp_historico
+        print(f" FP promedio (últimas 50):    {np.mean(ultimas):.4f}")
+        print(f" Desviación estándar FP:      {np.std(ultimas):.4f}")
+        print(f" FP mínimo:                   {np.min(ultimas):.4f}")
+        print(f" FP máximo:                   {np.max(ultimas):.4f}")
+    if not metodo_directo and controlador is not None:
+        print(f" Mejor FP registrado:         {controlador.mejor_fp:.4f}")
+        print(f" Fase FG en mejor FP:         {controlador.mejor_fase:.1f}°")
+        print(f" Fase FG final:               {controlador.fase_actual:.1f}°")
+    print("=" * 90)
 
 # ==============================================================================
-# FUNCIÓN PRINCIPAL
+# PROGRAMA PRINCIPAL
 # ==============================================================================
 
 def main():
-    rm = pyvisa.ResourceManager()
-    wt = YokogawaWT3000(GPIB_YOKOGAWA_WT)
+    print("\n" + "="*90)
+    print(" SELECCIÓN DEL MÉTODO DE CONTROL DE FP")
+    print("="*90)
+    print(" 1. DIRECTO    -> Sincronización libre sin lazo de control")
+    print(" 2. CONTROLADO -> Algoritmo PI Adaptativo con corrección de fase")
+    print("="*90)
+    opcion = input("Opción (1 o 2): ").strip()
+    while opcion not in ('1', '2'):
+        opcion = input("Opción inválida (1 o 2): ").strip()
+    metodo_directo = (opcion == '1')
+
     fg = None
-    
-    controlador = ControladorOffsetFrecuencia()
-    
-    total_iteraciones = 0
-    iteraciones_en_rango = 0
-    fp_historico = []
-    
-    print("=" * 90)
-    print(" SISTEMA DE CONTROL DE FP - CON OFFSET DE FRECUENCIA")
-    print(" ===================================================")
-    print(" Estrategia:")
-    print("   - Usar offset de frecuencia para crear desfase")
-    print("   - Offset estable y predecible")
-    print("   - Memoria del mejor punto encontrado")
-    print("=" * 90)
-    print(f"\n Configuración:")
-    print(f"   - Rango offset: {OFFSET_MIN}Hz a {OFFSET_MAX}Hz")
-    
+    wt = None
+
     try:
-        print("\n[1/4] Conectando al WT3000...")
+        fg = YokogawaFG420(DIR_FG, mode='fast')
+        wt = YokogawaWT3000(DIR_WT, mode='balanced')
+        controlador = ControladorFaseAvanzado() if not metodo_directo else None
+
+        total_iteraciones = 0
+        iteraciones_en_rango = 0
+        fp_historico = []
+
+        print("\n[1/3] Conectando equipos...")
         wt.conectar()
         wt.configurar_salida_numerica_estandar(elemento_entrada=ELEMENTO_WT)
-        print("  ✓ WT3000 conectado")
-        
-        print("\n[2/4] Conectando al FG420...")
-        fg = rm.open_resource(GPIB_YOKOGAWA_FG)
-        
-        if not configurar_fg420_offset(fg, 60.0, AMPLITUD_INICIAL):
-            raise Exception("Error en FG420")
-        
-        print(f"  ✓ FG420 configurado: 60.000 Hz, {AMPLITUD_INICIAL:.3f}V")
-        
-        print("\n[3/4] Esperando estabilización inicial...")
-        for i in range(5):
-            time.sleep(0.5)
-            print("  .", end="", flush=True)
-        print(" ✓")
-        
-        print("\n[4/4] INICIANDO CONTROL")
-        print("=" * 90)
-        print(f"{'Tiempo':<12} | {'FP':<10} | {'FP Prom':<10} | {'Frec FG':<12} | {'Offset':<12} | {'Mejor FP':<10} | {'Acción':<12} | {'Estado':<10}")
+
+        fg.conectar()
+        fg.configurar_canal_rapido(
+            canal=1,
+            funcion="SIN",
+            frecuencia_hz=60.0,
+            amplitud_vpp=AMPLITUD_INICIAL,
+            offset_v=0.0,
+            fase_grados=0.0,
+            activar_salida=True
+        )
+        fg.frecuencia_actual = 60.0
+
+        print("\n[2/3] Estabilizando lecturas...")
+        time.sleep(2.0)
+
+        print("\n[3/3] INICIANDO CONTROL")
         print("-" * 90)
-        
-        tiempo_inicio = time.time()
+        print(f"{'Tiempo':<8} | {'FP':<8} | {'FP Filt':<8} | {'Fase FG':<10} | {'Phi Med':<8} | {'Mejor FP':<8} | {'Acción':<12} | {'Estado':<8}")
+        print("-" * 90)
+
         tiempo_anterior = time.time()
-        tiempo_control = None
-        primer_fp = False
-        
+        tiempo_control = time.time()
+
         while True:
-            if tiempo_control is not None:
-                if time.time() - tiempo_control > TIEMPO_PRUEBA_SEG:
-                    break
-            
             t_actual = time.time()
+
+            if t_actual - tiempo_control > TIEMPO_PRUEBA_SEG:
+                break
+
             dt = t_actual - tiempo_anterior
             tiempo_anterior = t_actual
-            
+
             m = wt.leer_mediciones_estandar()
-            
             fp_medido = m.get("factor_potencia")
-            frec_medida = m.get("frecuencia")
-            
-            if fp_medido is None or frec_medida is None:
-                print(f"{datetime.now().strftime('%H:%M:%S')} | {'---':<10} | {'---':<10} | {'---':<12} | {'---':<12} | {'---':<10} | {'ERROR':<12} | {'COM_ERR':<10}")
+            phi_medido = m.get("angulo_fase")
+            frec_medida = m.get("frecuencia", 60.0)
+
+            if fp_medido is None or phi_medido is None:
                 time.sleep(INTERVALO_MUESTREO)
                 continue
-            
+
             fp_abs = abs(fp_medido)
-            
-            if not primer_fp:
-                primer_fp = True
-                tiempo_control = t_actual
-                print(f"\n[!] Señal detectada: FP={fp_abs:.4f}")
-                print("    Iniciando control con offset...\n")
-                print(f"{'Tiempo':<12} | {'FP':<10} | {'FP Prom':<10} | {'Frec FG':<12} | {'Offset':<12} | {'Mejor FP':<10} | {'Acción':<12} | {'Estado':<10}")
-                print("-" * 90)
-            
-            resultado = controlador.actualizar(fp_medido, frec_medida, dt)
-            
-            if resultado["cambio"]:
-                actualizar_fg420_offset(
-                    fg,
-                    resultado["frecuencia_fg"],
-                    resultado["amplitud"]
-                )
-            
-            segundos = int(time.time() - tiempo_control)
-            
-            en_rango = MARGEN_FP_MIN <= fp_abs <= MARGEN_FP_MAX
-            if en_rango:
-                iteraciones_en_rango += 1
-            
-            total_iteraciones += 1
-            fp_historico.append(fp_abs)
-            
-            timer_display = f"{segundos:03d}s"
-            str_3pct = "✓ RANGO" if en_rango else "✗ FUERA"
-            
-            mejor_fp_str = f"{resultado['mejor_fp']:.4f}"
-            
-            print(f"{timer_display:<12} | {fp_abs:<10.4f} | {resultado['fp']:<10.4f} | "
-                  f"{resultado['frecuencia_fg']:<12.4f} | {resultado['offset']:<+12.4f} | "
-                  f"{mejor_fp_str:<10} | {resultado['accion']:<12} | {str_3pct:<10}")
-            
+
+            if metodo_directo:
+                nueva_frec = max(59.0, min(61.0, frec_medida))
+                if abs(nueva_frec - getattr(fg, 'frecuencia_actual', 60.0)) > 0.001:
+                    fg.establecer_frecuencia(1, nueva_frec)
+                    fg.frecuencia_actual = nueva_frec
+
+                en_rango = MARGEN_FP_MIN <= fp_abs <= MARGEN_FP_MAX
+                if en_rango:
+                    iteraciones_en_rango += 1
+                total_iteraciones += 1
+                fp_historico.append(fp_abs)
+
+                segundos = int(time.time() - tiempo_control)
+                print(f"{segundos:03d}s     | {fp_abs:<8.4f} | {'N/A':<8} | {'0.0°':<10} | {phi_medido:<+8.1f} | {'N/A':<8} | {'DIRECTO':<12} | {('✓ OK' if en_rango else '✗ OUT'):<8}")
+
+            else:
+                res = controlador.actualizar(fp_medido, phi_medido, dt)
+
+                if res["cambio"]:
+                    fg.establecer_fase(1, res["fase_fg"])
+
+                en_rango = MARGEN_FP_MIN <= fp_abs <= MARGEN_FP_MAX
+                if en_rango:
+                    iteraciones_en_rango += 1
+                total_iteraciones += 1
+                fp_historico.append(fp_abs)
+
+                segundos = int(time.time() - tiempo_control)
+                print(f"{segundos:03d}s     | {fp_abs:<8.4f} | {res['fp_suavizado']:<8.4f} | {res['fase_fg']:<+10.1f} | {res['phi_suavizado']:<+8.1f} | {res['mejor_fp']:<8.4f} | {res['accion']:<12} | {('✓ OK' if en_rango else '✗ OUT'):<8}")
+
             time.sleep(max(0, INTERVALO_MUESTREO - (time.time() - t_actual)))
-        
-        # ======================================================================
-        # RESUMEN FINAL
-        # ======================================================================
-        
-        efectividad = (iteraciones_en_rango / total_iteraciones * 100) if total_iteraciones > 0 else 0
-        
-        print("\n" + "=" * 90)
-        print(" RESUMEN FINAL")
-        print("=" * 90)
-        print(f" Total iteraciones:           {total_iteraciones}")
-        print(f" En rango (1±3%):             {iteraciones_en_rango}")
-        print(f" Efectividad:                 {efectividad:.2f}%")
-        if fp_historico:
-            print(f" FP promedio final:           {np.mean(fp_historico[-50:]):.4f}")
-            print(f" Desviación estándar FP:      {np.std(fp_historico[-50:]):.4f}")
-        print(f" Mejor FP encontrado:         {controlador.mejor_fp:.4f}")
-        print(f" Offset en mejor FP:          {controlador.mejor_offset:.4f} Hz")
-        print(f" Offset final:                {controlador.offset_actual:.4f} Hz")
-        print(f" Frecuencia FG final:         {controlador.frecuencia_fg:.4f} Hz")
-        print("=" * 90)
-        
+
+        mostrar_resumen(controlador, metodo_directo, total_iteraciones, iteraciones_en_rango, fp_historico, time.time() - tiempo_control)
+
     except KeyboardInterrupt:
-        print("\n\n[!] Prueba cancelada por el usuario.")
-    except Exception as e:
-        print(f"\n[X] Error fatal: {e}")
-        import traceback
-        traceback.print_exc()
+        print("\n\n[!] Proceso detenido por el usuario.")
+        if 'tiempo_control' in locals():
+            mostrar_resumen(controlador, metodo_directo, total_iteraciones, iteraciones_en_rango, fp_historico, time.time() - tiempo_control)
+
     finally:
-        print("\n[!] Cerrando conexiones...")
-        
-        if fg:
+        print("\n[!] Apagando salidas y cerrando comunicación...")
+        if fg is not None:
             try:
-                fg.write(":OUTPut1:STATe OFF")
-                time.sleep(0.1)
-                fg.close()
-                print("  ✓ FG420 apagado")
-            except:
-                print("  ✗ Error al cerrar FG420")
-        
-        if wt:
+                fg.establecer_salida(1, False)
+                fg.desconectar()
+            except Exception:
+                pass
+        if wt is not None:
             try:
                 wt.desconectar()
-                print("  ✓ WT3000 desconectado")
-            except:
-                print("  ✗ Error al desconectar WT3000")
-        
-        print("[✓] Conexiones cerradas")
-        print("=" * 90)
+            except Exception:
+                pass
+        print("[✓] Conexiones finalizadas.")
 
 if __name__ == "__main__":
     main()

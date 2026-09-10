@@ -1,7 +1,7 @@
 import time
 from datetime import datetime
 import pyvisa
-from wtcontroller import YokogawaWT3000
+from controllers.wt3000controller import YokogawaWT3000
 
 
 def ejecutar_prueba_lectura():

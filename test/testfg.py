@@ -1,6 +1,6 @@
 import time
 import pyvisa
-from fg240controller import YokogawaFG420
+from controllers.fg420controller import YokogawaFG420
 
 
 def barrido_fase_grado_a_grado(gen: YokogawaFG420, canal: int, inicio: int = 0, fin: int = 360, retardo_paso_s: float = 0.003):
