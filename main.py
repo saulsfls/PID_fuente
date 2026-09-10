@@ -8,7 +8,7 @@ El offset crea un desfase acumulativo de forma estable
 import time
 import numpy as np
 from collections import deque
-from datetime import datetime
+from datetime import datetime 
 import pyvisa
 from wtcontroller import YokogawaWT3000
 
@@ -16,8 +16,8 @@ from wtcontroller import YokogawaWT3000
 # CONFIGURACIÓN
 # ==============================================================================
 
-GPIB_YOKOGAWA_WT = "GPIB0::1::INSTR"
-GPIB_YOKOGAWA_FG = "GPIB1::2::INSTR"
+GPIB_YOKOGAWA_WT = "GPIB0::1::INSTR" #Wattmetro WT3000
+GPIB_YOKOGAWA_FG = "GPIB1::2::INSTR" #Generador de funciones FG420
 
 ELEMENTO_WT = 1
 TIEMPO_PRUEBA_SEG = 300
