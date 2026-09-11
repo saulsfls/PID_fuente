@@ -1,19 +1,20 @@
 """
-SISTEMA DE CONTROL DE FP - MEJORADO (CONTROL PI ADAPTATIVO DE FASE)
-=====================================================================
-Optimizado para convergencia rápida a FP = 1.0 con anti-windup,
-detección de polaridad y búsqueda de rescate.
+CONTROL DE FP v4 - HILL CLIMBING SOBRE FP
+=================================================================
+ - No usa angulo_fase (el WT3000 no lo entrega)
+ - Búsqueda por pasos con inversión de dirección
+ - Reset del filtro tras cada cambio de fase
+ - Bloqueo al alcanzar el óptimo
 """
 
 import time
 import numpy as np
-from datetime import datetime
 
 from controllers.fg420controller import YokogawaFG420
 from controllers.wt3000controller import YokogawaWT3000
 
 # ==============================================================================
-# CONFIGURACIÓN GENERAL
+# CONFIGURACIÓN
 # ==============================================================================
 
 DIR_FG = "GPIB1::2::INSTR"
@@ -23,198 +24,273 @@ ELEMENTO_WT = 1
 TIEMPO_PRUEBA_SEG = 300
 INTERVALO_MUESTREO = 0.5
 
-FP_OBJETIVO = 1.0
-MARGEN_FP_MIN = 0.970
-MARGEN_FP_MAX = 1.030
+FP_MIN_RANGO = 0.970
+FP_MAX_RANGO = 1.030
 
-AMPLITUD_MIN = 2.0
-AMPLITUD_MAX = 10.0
 AMPLITUD_INICIAL = 5.0
-
 FASE_MIN = -180.0
 FASE_MAX = 180.0
 
+FREC_NOMINAL = 60.0
+FREC_MIN = 55.0
+FREC_MAX = 65.0
+
+# Sincronización de frecuencia
+FILTRO_FREC = 0.30
+DEADBAND_FREC = 0.003
+GANANCIA_FREC = 0.60
+
 # ==============================================================================
-# PARÁMETROS OPTIMIZADOS DEL CONTROLADOR
+# PARÁMETROS DEL HILL CLIMBING
 # ==============================================================================
 
-KP_FASE = 0.45            # Ganancia Proporcional base
-KI_FASE = 0.08            # Ganancia Integral (elimina error estacionario)
-FILTRO_PHI = 0.35         # Filtro más rápido (menor retardo de fase)
-DEADBAND_PHI = 0.15       # Umbral fino de zona muerta en grados
+N_SETTLE = 4               # muestras a esperar tras cada cambio de fase
+PASO_INICIAL = 15.0        # ° del primer paso
+PASO_MIN = 0.5             # ° paso mínimo (parar si llegamos aquí)
+PASO_MAX = 30.0
+FACTOR_REDUCIR = 0.65      # al invertir o no mejorar
+UMBRAL_MEJORA = 0.008      # ΔFP mínimo para considerar "mejoró"
+UMBRAL_EMPEORA = 0.008     # ΔFP mínimo para considerar "empeoró"
+
+# Bloqueo
+FP_OPTIMO = 0.995          # consideramos óptimo si FP > esto
+N_OPTIMO = 6               # muestras consecutivas para bloquear
+FP_DESBLOQUEO = 0.985      # si cae por debajo, desbloquear
 
 # ==============================================================================
-# CLASE CONTROLADOR PI ADAPTATIVO
+# UTILIDADES
 # ==============================================================================
 
-class ControladorFaseAvanzado:
+def envolver_fase(ang):
+    return ((ang + 180.0) % 360.0) - 180.0
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+# ==============================================================================
+# CONTROLADOR v4
+# ==============================================================================
+
+class ControladorFP:
     def __init__(self):
+        # Actuador
         self.fase_actual = 0.0
-        self.amplitud_actual = AMPLITUD_INICIAL
-        self.phi_suavizado = 0.0
-        self.fp_suavizado = 1.0
+        self.frec_actual = FREC_NOMINAL
+        self.frec_medida_filtrada = FREC_NOMINAL
 
-        # Término integral
-        self.integral_error = 0.0
+        # Medición
+        self.fp_suavizado = None
 
-        # Mejor punto histórico (Rescate)
+        # Mejor histórico
         self.mejor_fp = 0.0
         self.mejor_fase = 0.0
-        self.mejor_amplitud = AMPLITUD_INICIAL
+        self.mejor_frec = FREC_NOMINAL
 
-        # Detección de divergencia y saturación
-        self.contador_saturado = 0
-        self.polaridad = 1.0  # Multiplicador de dirección de corrección
+        # Estado hill-climbing
+        self.direccion = +1.0
+        self.paso = PASO_INICIAL
+        self.fase_anterior = None
+        self.fp_en_fase_anterior = None
+        self.contador_settle = 0
 
-    def actualizar(self, fp_medido, phi_medido, dt):
-        # 1. Filtrado dinámico
-        if phi_medido is not None and abs(phi_medido) <= 180:
-            self.phi_suavizado = (1 - FILTRO_PHI) * self.phi_suavizado + FILTRO_PHI * phi_medido
-        if fp_medido is not None and abs(fp_medido) <= 2.0:
-            self.fp_suavizado = (1 - FILTRO_PHI) * self.fp_suavizado + FILTRO_PHI * abs(fp_medido)
+        # Bloqueo
+        self.bloqueado = False
+        self.contador_optimo = 0
 
-        # 2. Registrar mejor desempeño
-        if self.fp_suavizado > self.mejor_fp and self.fp_suavizado <= 1.05:
-            self.mejor_fp = self.fp_suavizado
+        # Diagnóstico
+        self.n_cambios_fase = 0
+        self.n_cambios_sin_efecto = 0
+        self.ultimo_delta_fp = 0.0
+        self.alerta_sin_efecto = False
+
+    # ------------------------------------------------------------------
+    def actualizar_frecuencia(self, frec_medida):
+        if frec_medida is None or not (FREC_MIN <= frec_medida <= FREC_MAX):
+            return False
+        self.frec_medida_filtrada = (
+            (1.0 - FILTRO_FREC) * self.frec_medida_filtrada
+            + FILTRO_FREC * frec_medida
+        )
+        error = self.frec_medida_filtrada - self.frec_actual
+        if abs(error) < DEADBAND_FREC:
+            return False
+        nueva = clamp(self.frec_actual + GANANCIA_FREC * error, FREC_MIN, FREC_MAX)
+        if abs(nueva - self.frec_actual) < 1e-4:
+            return False
+        self.frec_actual = nueva
+        return True
+
+    # ------------------------------------------------------------------
+    def _respuesta(self, cambio_fase=False, accion="ESTABLE"):
+        return {
+            "cambio_fase": cambio_fase,
+            "fase_fg": self.fase_actual,
+            "frec_fg": self.frec_actual,
+            "fp_suavizado": self.fp_suavizado if self.fp_suavizado is not None else 0.0,
+            "mejor_fp": self.mejor_fp,
+            "mejor_fase": self.mejor_fase,
+            "bloqueado": self.bloqueado,
+            "direccion": self.direccion,
+            "paso": self.paso,
+            "delta_fp": self.ultimo_delta_fp,
+            "alerta": self.alerta_sin_efecto,
+            "accion": accion,
+        }
+
+    # ------------------------------------------------------------------
+    def _filtrar_fp(self, fp_real):
+        if fp_real is None:
+            return
+        if self.fp_suavizado is None:
+            self.fp_suavizado = fp_real
+        else:
+            # Media exponencial suave dentro de cada settle
+            self.fp_suavizado = 0.6 * self.fp_suavizado + 0.4 * fp_real
+
+    # ------------------------------------------------------------------
+    def actualizar(self, fp_medido):
+        fp_real = abs(fp_medido) if fp_medido is not None else None
+
+        self._filtrar_fp(fp_real)
+
+        # Mejor histórico
+        if fp_real is not None and fp_real > self.mejor_fp + 0.0005:
+            self.mejor_fp = fp_real
             self.mejor_fase = self.fase_actual
-            self.mejor_amplitud = self.amplitud_actual
+            self.mejor_frec = self.frec_actual
 
-        # 3. Lógica de rescate ante saturación o colapso de FP
-        if abs(self.fase_actual) >= (FASE_MAX - 1.0) or self.fp_suavizado < 0.35:
-            self.contador_saturado += 1
-            if self.contador_saturado > 4:
-                # Regresar a la mejor fase conocida e invertir polaridad de control
-                self.fase_actual = self.mejor_fase
-                self.integral_error = 0.0
-                self.polaridad *= -1.0
-                self.contador_saturado = 0
-                return {
-                    "fase_fg": self.fase_actual,
-                    "amplitud": self.amplitud_actual,
-                    "phi_suavizado": self.phi_suavizado,
-                    "fp_suavizado": self.fp_suavizado,
-                    "error_phi": 0.0,
-                    "correccion": 0.0,
-                    "cambio": True,
-                    "mejor_fp": self.mejor_fp,
-                    "mejor_fase": self.mejor_fase,
-                    "mejor_amplitud": self.mejor_amplitud,
-                    "saturado": True,
-                    "accion": "RESCATE_FASE"
-                }
+        # Bloqueo
+        if fp_real is not None and fp_real > FP_OPTIMO:
+            self.contador_optimo += 1
         else:
-            self.contador_saturado = 0
+            self.contador_optimo = 0
+        if self.contador_optimo >= N_OPTIMO:
+            self.bloqueado = True
+        if self.bloqueado and fp_real is not None and fp_real < FP_DESBLOQUEO:
+            self.bloqueado = False
+            self.contador_optimo = 0
 
-        # 4. Cálculo del error (Objetivo: phi -> 0)
-        error_phi = self.phi_suavizado * self.polaridad
+        if self.bloqueado:
+            return self._respuesta(accion="BLOQUEADO")
 
-        if abs(error_phi) < DEADBAND_PHI:
-            return self._respuesta_sin_cambio()
+        if self.fp_suavizado is None:
+            return self._respuesta(accion="SIN_FP")
 
-        # 5. Adaptatividad de paso según la magnitud del problema
-        abs_err = abs(error_phi)
-        if abs_err > 20.0:
-            paso_max = 5.0
-            kp_adj = KP_FASE * 1.5
-        elif abs_err > 5.0:
-            paso_max = 2.0
-            kp_adj = KP_FASE
+        # --------------------------------------------------------------
+        # Arranque: primera medición
+        # --------------------------------------------------------------
+        if self.fase_anterior is None:
+            self.contador_settle += 1
+            if self.contador_settle < N_SETTLE:
+                return self._respuesta(accion="INIT")
+            # Fijar referencia y dar el primer paso
+            self.fase_anterior = self.fase_actual
+            self.fp_en_fase_anterior = self.fp_suavizado
+            self.fase_actual = envolver_fase(self.fase_actual + self.direccion * self.paso)
+            self.fp_suavizado = None
+            self.contador_settle = 0
+            self.n_cambios_fase += 1
+            return self._respuesta(cambio_fase=True,
+                                   accion=f"INICIO{self.direccion*self.paso:+.0f}")
+
+        # --------------------------------------------------------------
+        # Esperando a que asiente el FP tras un cambio
+        # --------------------------------------------------------------
+        self.contador_settle += 1
+        if self.contador_settle < N_SETTLE:
+            return self._respuesta(accion="SETTLE")
+
+        # --------------------------------------------------------------
+        # Evaluar el paso que dimos
+        # --------------------------------------------------------------
+        delta = self.fp_suavizado - self.fp_en_fase_anterior
+        self.ultimo_delta_fp = delta
+
+        if delta > UMBRAL_MEJORA:
+            # Mejoró: seguir en la misma dirección
+            pass
+        elif delta < -UMBRAL_EMPEORA:
+            # Empeoró: invertir y reducir paso
+            self.direccion *= -1.0
+            self.paso = max(self.paso * FACTOR_REDUCIR, PASO_MIN)
         else:
-            paso_max = 0.5
-            kp_adj = KP_FASE * 0.7
+            # Neutro: reducir paso y probar de nuevo (misma dirección)
+            self.paso = max(self.paso * 0.85, PASO_MIN)
 
-        # 6. Cálculo PI
-        self.integral_error += error_phi * dt
-        # Limitar viento del acumulador integral (Anti-windup)
-        self.integral_error = max(-20.0, min(20.0, self.integral_error))
+        # Detección de "sin efecto" (hardware no responde)
+        if abs(delta) < 0.002 and self.n_cambios_fase >= 4:
+            self.n_cambios_sin_efecto += 1
+            if self.n_cambios_sin_efecto >= 3:
+                self.alerta_sin_efecto = True
+        else:
+            self.n_cambios_sin_efecto = 0
 
-        p_term = kp_adj * error_phi
-        i_term = KI_FASE * self.integral_error
+        # --------------------------------------------------------------
+        # ¿Estamos suficientemente cerca del óptimo?
+        # --------------------------------------------------------------
+        if abs(1.0 - self.fp_suavizado) < (1.0 - FP_OPTIMO):
+            # Nos quedamos donde estamos
+            return self._respuesta(accion="CERCA_OPTIMO")
 
-        correccion = p_term + i_term
-        correccion = max(-paso_max, min(paso_max, correccion))
+        # --------------------------------------------------------------
+        # Dar el siguiente paso
+        # --------------------------------------------------------------
+        self.fase_anterior = self.fase_actual
+        self.fp_en_fase_anterior = self.fp_suavizado
+        self.fase_actual = envolver_fase(
+            clamp(self.fase_actual + self.direccion * self.paso, FASE_MIN, FASE_MAX)
+        )
+        self.fp_suavizado = None
+        self.contador_settle = 0
+        self.n_cambios_fase += 1
 
-        nueva_fase = self.fase_actual - correccion
-        nueva_fase = max(FASE_MIN, min(FASE_MAX, nueva_fase))
-
-        if abs(nueva_fase - self.fase_actual) < 0.02:
-            return self._respuesta_sin_cambio()
-
-        self.fase_actual = nueva_fase
-
-        return {
-            "fase_fg": self.fase_actual,
-            "amplitud": self.amplitud_actual,
-            "phi_suavizado": self.phi_suavizado,
-            "fp_suavizado": self.fp_suavizado,
-            "error_phi": error_phi,
-            "correccion": correccion,
-            "cambio": True,
-            "mejor_fp": self.mejor_fp,
-            "mejor_fase": self.mejor_fase,
-            "mejor_amplitud": self.mejor_amplitud,
-            "saturado": False,
-            "accion": f"FASE_{correccion:+.2f}"
-        }
-
-    def _respuesta_sin_cambio(self):
-        return {
-            "fase_fg": self.fase_actual,
-            "amplitud": self.amplitud_actual,
-            "phi_suavizado": self.phi_suavizado,
-            "fp_suavizado": self.fp_suavizado,
-            "error_phi": 0,
-            "correccion": 0,
-            "cambio": False,
-            "mejor_fp": self.mejor_fp,
-            "mejor_fase": self.mejor_fase,
-            "mejor_amplitud": self.mejor_amplitud,
-            "saturado": False,
-            "accion": "ESTABLE"
-        }
+        signo = "+" if self.direccion > 0 else "-"
+        return self._respuesta(cambio_fase=True,
+                               accion=f"PASO{signo}{self.paso:.1f}")
 
 # ==============================================================================
-# FUNCIÓN DE ESTADÍSTICAS
+# RESUMEN
 # ==============================================================================
 
-def mostrar_resumen(controlador, metodo_directo, total_iteraciones, iteraciones_en_rango,
-                    fp_historico, tiempo_total=None):
-    efectividad = (iteraciones_en_rango / total_iteraciones * 100) if total_iteraciones > 0 else 0
-
+def mostrar_resumen(controlador, total, en_rango, fp_hist, frec_hist, t_total):
+    efectividad = (en_rango / total * 100) if total > 0 else 0
     print("\n" + "=" * 90)
-    print(" RESUMEN FINAL DE PRUEBA")
+    print(" RESUMEN FINAL")
     print("=" * 90)
-    if tiempo_total is not None:
-        print(f" Tiempo total de prueba:      {tiempo_total:.1f} s")
-    print(f" Total iteraciones:           {total_iteraciones}")
-    print(f" En rango (1±3%):             {iteraciones_en_rango}")
-    print(f" Efectividad:                 {efectividad:.2f}%")
-    if fp_historico:
-        ultimas = fp_historico[-50:] if len(fp_historico) >= 50 else fp_historico
-        print(f" FP promedio (últimas 50):    {np.mean(ultimas):.4f}")
-        print(f" Desviación estándar FP:      {np.std(ultimas):.4f}")
-        print(f" FP mínimo:                   {np.min(ultimas):.4f}")
-        print(f" FP máximo:                   {np.max(ultimas):.4f}")
-    if not metodo_directo and controlador is not None:
-        print(f" Mejor FP registrado:         {controlador.mejor_fp:.4f}")
-        print(f" Fase FG en mejor FP:         {controlador.mejor_fase:.1f}°")
-        print(f" Fase FG final:               {controlador.fase_actual:.1f}°")
+    print(f" Tiempo total:                {t_total:.1f} s")
+    print(f" Iteraciones:                 {total}")
+    print(f" En rango (1±3%):             {en_rango}  ({efectividad:.1f}%)")
+    if fp_hist:
+        ult = fp_hist[-50:] if len(fp_hist) >= 50 else fp_hist
+        print(f" FP promedio (últimas 50):    {np.mean(ult):.4f}")
+        print(f" Desv. estándar FP:           {np.std(ult):.4f}")
+        print(f" FP mín / máx:                {np.min(ult):.4f} / {np.max(ult):.4f}")
+    if frec_hist:
+        uf = frec_hist[-50:] if len(frec_hist) >= 50 else frec_hist
+        print(f" Frec prom / std:             {np.mean(uf):.4f} / {np.std(uf):.5f} Hz")
+    if controlador is not None:
+        print(f" Mejor FP:                    {controlador.mejor_fp:.4f}")
+        print(f" Fase FG en mejor:            {controlador.mejor_fase:+.1f}°")
+        print(f" Fase FG final:               {controlador.fase_actual:+.1f}°")
+        print(f" Dirección final:             {'+' if controlador.direccion>0 else '-'}")
+        print(f" Paso final:                  {controlador.paso:.2f}°")
+        print(f" Cambios de fase dados:       {controlador.n_cambios_fase}")
+        if controlador.alerta_sin_efecto:
+            print(f" *** ALERTA: fase del FG no parece afectar FP ***")
     print("=" * 90)
 
 # ==============================================================================
-# PROGRAMA PRINCIPAL
+# MAIN
 # ==============================================================================
 
 def main():
     print("\n" + "="*90)
-    print(" SELECCIÓN DEL MÉTODO DE CONTROL DE FP")
+    print(" CONTROL DE FP v4 - HILL CLIMBING SOBRE FP")
     print("="*90)
-    print(" 1. DIRECTO    -> Sincronización libre sin lazo de control")
-    print(" 2. CONTROLADO -> Algoritmo PI Adaptativo con corrección de fase")
-    print("="*90)
-    opcion = input("Opción (1 o 2): ").strip()
+    print(" (No requiere el ángulo del WT3000)")
+    opcion = input(" 1 DIRECTO   |  2 HILL CLIMBING  -> ").strip()
     while opcion not in ('1', '2'):
-        opcion = input("Opción inválida (1 o 2): ").strip()
+        opcion = input("Opción (1 o 2): ").strip()
     metodo_directo = (opcion == '1')
 
     fg = None
@@ -223,11 +299,11 @@ def main():
     try:
         fg = YokogawaFG420(DIR_FG, mode='fast')
         wt = YokogawaWT3000(DIR_WT, mode='balanced')
-        controlador = ControladorFaseAvanzado() if not metodo_directo else None
+        controlador = ControladorFP()
 
-        total_iteraciones = 0
-        iteraciones_en_rango = 0
-        fp_historico = []
+        total = en_rango = 0
+        fp_hist = []
+        frec_hist = []
 
         print("\n[1/3] Conectando equipos...")
         wt.conectar()
@@ -235,88 +311,92 @@ def main():
 
         fg.conectar()
         fg.configurar_canal_rapido(
-            canal=1,
-            funcion="SIN",
-            frecuencia_hz=60.0,
+            canal=1, funcion="SIN",
+            frecuencia_hz=FREC_NOMINAL,
             amplitud_vpp=AMPLITUD_INICIAL,
-            offset_v=0.0,
-            fase_grados=0.0,
-            activar_salida=True
+            offset_v=0.0, fase_grados=0.0,
+            activar_salida=True,
         )
-        fg.frecuencia_actual = 60.0
+        fg.frecuencia_actual = FREC_NOMINAL
 
-        print("\n[2/3] Estabilizando lecturas...")
-        time.sleep(2.0)
+        print("\n[2/3] Estabilizando 3 s...")
+        time.sleep(3.0)
 
         print("\n[3/3] INICIANDO CONTROL")
-        print("-" * 90)
-        print(f"{'Tiempo':<8} | {'FP':<8} | {'FP Filt':<8} | {'Fase FG':<10} | {'Phi Med':<8} | {'Mejor FP':<8} | {'Acción':<12} | {'Estado':<8}")
-        print("-" * 90)
+        print("-" * 120)
+        print(f"{'t':<5}| {'FP':<8}| {'FPflt':<8}| {'FaseFG':<8}| {'FrecFG':<9}| "
+              f"{'Mejor':<8}| {'Dir':<4}| {'Paso':<7}| {'ΔFP':<8}| "
+              f"{'Acción':<14}| Estado")
+        print("-" * 120)
 
-        tiempo_anterior = time.time()
-        tiempo_control = time.time()
+        t_prev = t_ctrl = time.time()
 
         while True:
-            t_actual = time.time()
-
-            if t_actual - tiempo_control > TIEMPO_PRUEBA_SEG:
+            t_now = time.time()
+            if t_now - t_ctrl > TIEMPO_PRUEBA_SEG:
                 break
-
-            dt = t_actual - tiempo_anterior
-            tiempo_anterior = t_actual
+            dt = t_now - t_prev
+            t_prev = t_now
 
             m = wt.leer_mediciones_estandar()
-            fp_medido = m.get("factor_potencia")
-            phi_medido = m.get("angulo_fase")
-            frec_medida = m.get("frecuencia", 60.0)
+            fp_med = m.get("factor_potencia")
+            frec_med = m.get("frecuencia", FREC_NOMINAL)
 
-            if fp_medido is None or phi_medido is None:
+            if fp_med is None:
                 time.sleep(INTERVALO_MUESTREO)
                 continue
 
-            fp_abs = abs(fp_medido)
+            fp_abs = abs(fp_med)
+            frec_hist.append(frec_med)
+
+            if controlador.actualizar_frecuencia(frec_med):
+                fg.establecer_frecuencia(1, controlador.frec_actual)
 
             if metodo_directo:
-                nueva_frec = max(59.0, min(61.0, frec_medida))
-                if abs(nueva_frec - getattr(fg, 'frecuencia_actual', 60.0)) > 0.001:
-                    fg.establecer_frecuencia(1, nueva_frec)
-                    fg.frecuencia_actual = nueva_frec
-
-                en_rango = MARGEN_FP_MIN <= fp_abs <= MARGEN_FP_MAX
-                if en_rango:
-                    iteraciones_en_rango += 1
-                total_iteraciones += 1
-                fp_historico.append(fp_abs)
-
-                segundos = int(time.time() - tiempo_control)
-                print(f"{segundos:03d}s     | {fp_abs:<8.4f} | {'N/A':<8} | {'0.0°':<10} | {phi_medido:<+8.1f} | {'N/A':<8} | {'DIRECTO':<12} | {('✓ OK' if en_rango else '✗ OUT'):<8}")
-
+                en_rango += 1 if FP_MIN_RANGO <= fp_abs <= FP_MAX_RANGO else 0
+                total += 1
+                fp_hist.append(fp_abs)
+                s = int(time.time() - t_ctrl)
+                print(f"{s:<5}| {fp_abs:<8.4f}| {'N/A':<8}| "
+                      f"{controlador.fase_actual:<+8.1f}| "
+                      f"{controlador.frec_actual:<9.4f}| {'N/A':<8}| "
+                      f"{'--':<4}| {'--':<7}| {'--':<8}| "
+                      f"{'DIRECTO':<14}| "
+                      f"{'OK' if FP_MIN_RANGO <= fp_abs <= FP_MAX_RANGO else 'OUT'}")
             else:
-                res = controlador.actualizar(fp_medido, phi_medido, dt)
-
-                if res["cambio"]:
+                res = controlador.actualizar(fp_med)
+                if res["cambio_fase"]:
                     fg.establecer_fase(1, res["fase_fg"])
 
-                en_rango = MARGEN_FP_MIN <= fp_abs <= MARGEN_FP_MAX
-                if en_rango:
-                    iteraciones_en_rango += 1
-                total_iteraciones += 1
-                fp_historico.append(fp_abs)
+                en_rango += 1 if FP_MIN_RANGO <= fp_abs <= FP_MAX_RANGO else 0
+                total += 1
+                fp_hist.append(fp_abs)
 
-                segundos = int(time.time() - tiempo_control)
-                print(f"{segundos:03d}s     | {fp_abs:<8.4f} | {res['fp_suavizado']:<8.4f} | {res['fase_fg']:<+10.1f} | {res['phi_suavizado']:<+8.1f} | {res['mejor_fp']:<8.4f} | {res['accion']:<12} | {('✓ OK' if en_rango else '✗ OUT'):<8}")
+                s = int(time.time() - t_ctrl)
+                estado = "BLOQ" if res["bloqueado"] else (
+                    "OK" if FP_MIN_RANGO <= fp_abs <= FP_MAX_RANGO else "OUT")
+                if res["alerta"]:
+                    estado = "ALERTA"
+                print(f"{s:<5}| {fp_abs:<8.4f}| {res['fp_suavizado']:<8.4f}| "
+                      f"{res['fase_fg']:<+8.1f}| {res['frec_fg']:<9.4f}| "
+                      f"{res['mejor_fp']:<8.4f}| "
+                      f"{('+' if res['direccion']>0 else '-'):<4}| "
+                      f"{res['paso']:<7.2f}| {res['delta_fp']:<+8.4f}| "
+                      f"{res['accion']:<14}| {estado}")
 
-            time.sleep(max(0, INTERVALO_MUESTREO - (time.time() - t_actual)))
+            time.sleep(max(0, INTERVALO_MUESTREO - (time.time() - t_now)))
 
-        mostrar_resumen(controlador, metodo_directo, total_iteraciones, iteraciones_en_rango, fp_historico, time.time() - tiempo_control)
+        mostrar_resumen(controlador, total, en_rango, fp_hist, frec_hist,
+                        time.time() - t_ctrl)
 
     except KeyboardInterrupt:
-        print("\n\n[!] Proceso detenido por el usuario.")
-        if 'tiempo_control' in locals():
-            mostrar_resumen(controlador, metodo_directo, total_iteraciones, iteraciones_en_rango, fp_historico, time.time() - tiempo_control)
+        print("\n\n[!] Detenido.")
+        if 'controlador' in locals():
+            mostrar_resumen(controlador, total, en_rango, fp_hist, frec_hist,
+                            time.time() - t_ctrl if 't_ctrl' in locals() else 0)
 
     finally:
-        print("\n[!] Apagando salidas y cerrando comunicación...")
+        print("\n[!] Apagando...")
         if fg is not None:
             try:
                 fg.establecer_salida(1, False)
@@ -328,7 +408,8 @@ def main():
                 wt.desconectar()
             except Exception:
                 pass
-        print("[✓] Conexiones finalizadas.")
+        print("[✓] Listo.")
+
 
 if __name__ == "__main__":
     main()
