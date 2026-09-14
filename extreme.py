@@ -1,22 +1,27 @@
 """
-CONTROL DE FP v9.5 - PI fuerte en FIJAR + objetivos configurables
+CONTROL DE FP v9.7 - Hill-climb decisivo sobre FASE en FIJAR
 =============================================================================
-Fixes v9.5 (basados en v9.4 que mostró 9.5% en rango con best=+0.5001):
+Fixes v9.7 (basados en v9.6 que mostró 34.0% con mejor FP +0.9995 en +58°):
 
- BUG E: KP_FIJAR=0.002 era ridículo. PI con Δf=0.0017 Hz jamás movía FP.
-        FIX:  KP×25, KI×4, DF_MAX×2.5.
+ BUG J: FIJAR casi no actuaba (78 cambios de fase en 135 s ≈ 1 cada 1.7 s).
+        FIX:  dead-zone 0.015 → 0.003, cooldown 3 → 1, eval 4 → 3,
+              paso inicial 2° → 3°, paso máx 12° → 15°.
 
- BUG F: micro-ajuste nunca disparaba porque |Δf| nunca saturaba.
-        FIX:  trigger alternativo "llevo N iteraciones fuera de banda en FIJAR".
+ BUG K: PI de frecuencia en FIJAR saturaba a ±0.010 Hz sin mover el FP.
+        FIX:  KP_FIJAR = KI_FIJAR = DF_FIJAR_MAX = 0. FIJAR solo mueve fase.
 
- BUG G: PASO_DF_MIN=0.003 Hz ≈ 0.015 FP, mitad de la tolerancia.
-        FIX:  PASO_DF_MIN=0.0012 Hz.
+ BUG L: f_filt se actualizaba en FIJAR, metiendo ruido del WT en el FG420.
+        FIX:  FIJAR_FREEZE_FREQ = True. Frecuencia congelada en FIJAR.
 
- BUG H: AJUSTAR hacía ping-pong.
-        FIX:  sensibilidad adaptativa (reduce paso si no mejora).
+ BUG M: no había mecanismo de return-to-best dentro de FIJAR.
+        FIX:  running-best + salto de una sola escritura si dist > 3×dist_min.
 
- BUG I: FIJAR salía cada 0.75 s.
-        FIX:  N_CONSEC_FIJAR_FAIL=40, DELTA_SALIR_FIJAR=0.10.
+ BUG N: se escribía la frecuencia en cada iteración aunque no cambiara.
+        FIX:  umbral FREQ_WRITE_EPS = 0.2 mHz. Menos writes → más tasa.
+
+La máquina de estados BUSCAR/AJUSTAR/FIJAR y el hill-climb sobre fase
+son los mismos conceptos que v9.6, pero con parámetros sintonizados para
+que FIJAR reaccione en ~150-200 ms en lugar de ~350 ms.
 """
 import time
 import numpy as np
@@ -28,17 +33,21 @@ from controllers.wt3000controller import YokogawaWT3000
 # CONFIGURACIÓN
 # ==============================================================================
 
+# --- Selector de modo de I/O ---
+MODO_EXTREME = True
+INTERVALO_EXTREME = 0.0
+INTERVALO_MUESTREO = 0.05
+
 DIR_FG = "GPIB1::2::INSTR"
 DIR_WT = "GPIB0::1::INSTR"
 ELEMENTO_WT = 1
 TIEMPO_PRUEBA_SEG = 600
-INTERVALO_MUESTREO = 0.05
 
+# --- Objetivos ---
 FP_OBJETIVO_MAG = 1.0
 FP_OBJETIVO     = 1.0
 TIPO_CARGA      = "RESISTIVO"
 TOLERANCIA_FP   = 0.03
-
 FP_MIN_RANGO = FP_OBJETIVO - TOLERANCIA_FP
 FP_MAX_RANGO = FP_OBJETIVO + TOLERANCIA_FP
 
@@ -50,56 +59,61 @@ FREC_MIN, FREC_MAX = 55.0, 65.0
 
 ALPHA_F = 0.08
 BETA_F = 0.002
-
 FP_BUF_LEN = 3
 
 # --- Transiciones de modo ---
 DELTA_BUSCAR_AJUSTAR = 0.100
-DELTA_AJUSTAR_FIJAR  = 0.045       # antes 0.030
-DELTA_SALIR_FIJAR    = 0.100       # antes 0.060
+DELTA_AJUSTAR_FIJAR  = 0.045
+DELTA_SALIR_FIJAR    = 0.15       # antes 0.100
 DELTA_REBUSCAR       = 0.300
 
 N_CONSEC_BUSCAR_OK = 2
 N_CONSEC_FIJAR_OK  = 3
-N_CONSEC_FIJAR_FAIL = 40           # antes 15  → FIJAR muy pegajoso
+N_CONSEC_FIJAR_FAIL = 30          # antes 40
 
 N_WARMUP_AJUSTAR = 8
-N_WARMUP_FIJAR   = 4               # NUEVO
+N_WARMUP_FIJAR   = 6              # antes 4
 
 # --- BUSCAR ---
 PASO_FASE_INICIAL = 25.0
 PASO_FASE_MIN = 2.0
 N_ESPERA_BUSCAR = 5
-
 N_MOVES_SIN_MEJORA = 20
 N_MOVES_TOTAL_MAX  = 60
 
-# --- AJUSTAR (más fino) ---
-PASO_DF_INICIAL = 0.010            # antes 0.015
-PASO_DF_MIN = 0.0012               # antes 0.003 (BUG G)
+# --- AJUSTAR ---
+PASO_DF_INICIAL = 0.010
+PASO_DF_MIN = 0.0012
 N_APLICAR_DF = 3
 N_ESPERA_DF = 5
 
-# --- FIJAR: PI FUERTE (BUG E) ---
-KP_FIJAR = 0.050                   # antes 0.0020  (×25)
-KI_FIJAR = 0.020                   # antes 0.0050  (×4)
-DF_FIJAR_MAX = 0.020               # antes 0.008   (×2.5)
+# --- FIJAR v9.7: hill-climb decisivo sobre FASE ---
+FIJAR_ACTIVO_UMBRAL  = 0.003      # antes 0.015
+FIJAR_COOLDOWN       = 1          # antes 3
+FIJAR_EVAL_ITER      = 3          # antes 4
+FIJAR_PASO_INICIAL   = 3.0        # antes 2.0
+FIJAR_PASO_MIN       = 0.3        # antes 0.5
+FIJAR_PASO_MAX       = 15.0       # antes 12.0
+FIJAR_UMBRAL_MEJORA  = 0.002      # antes 0.004
+FIJAR_RETURN_BEST    = 3.0        # nuevo
+FIJAR_FREEZE_FREQ    = True       # nuevo
 
-# --- Micro-ajuste de fase en FIJAR (BUG F) ---
-MICRO_FASE_PASO = 3.0
-MICRO_FASE_N_FUERA = 60            # iteraciones fuera de banda antes de micro
-MICRO_FASE_COOLDOWN = 80
+# PI de frecuencia DESACTIVADO en FIJAR
+KP_FIJAR      = 0.0
+KI_FIJAR      = 0.0
+DF_FIJAR_MAX  = 0.0
 
 # --- Anti-oscilación ---
 N_EMPEORAS_SEGUIDAS = 2
-
 UMBRAL_MEJORA = 0.003
 UMBRAL_EMPEORA = 0.003
 UMBRAL_EFECTO = 0.004
-
 UMBRAL_STREAK_1 = 10.0
 UMBRAL_STREAK_2 = 30.0
 UMBRAL_STREAK_3 = 60.0
+
+# --- Umbral de escritura de frecuencia ---
+FREQ_WRITE_EPS = 2e-4   # 0.2 mHz
 
 
 def envolver_fase(a):
@@ -184,7 +198,7 @@ class FrecuenciaTracker:
     def update(self, f_meas, dt):
         if dt <= 1e-6:
             return self.f, self.df
-        dt = clamp(dt, 0.01, 0.3)
+        dt = clamp(dt, 0.005, 0.3)   # v9.7: mínimo 5 ms (antes 10 ms)
         f_pred = self.f + self.df * dt
         e = f_meas - f_pred
         self.f = f_pred + self.alpha * e
@@ -265,10 +279,17 @@ class Estadisticas:
             self.streak_inicio_t = None
         return evento
 
-    def resumen(self, controlador, t_total, n_iter, en_rango):
+    def resumen(self, controlador, t_total, n_iter, en_rango, fg=None, wt=None):
+        titulo = "RESUMEN FINAL v9.7 (FASE decisiva + sin PI freq)" \
+                 if MODO_EXTREME else "RESUMEN FINAL v9.7 (streaming)"
         print("\n" + "=" * 90)
-        print(" RESUMEN FINAL v9.5")
+        print(f" {titulo}")
         print("=" * 90)
+
+        print(f"\n[ Modo de I/O ]")
+        print(f"  Selector:                {'EXTREME' if MODO_EXTREME else 'streaming'}")
+        print(f"  Intervalo objetivo:      "
+              f"{INTERVALO_EXTREME if MODO_EXTREME else INTERVALO_MUESTREO:.4f} s")
 
         print(f"\n[ Objetivo ]")
         print(f"  Tipo de carga:           {TIPO_CARGA}")
@@ -305,8 +326,26 @@ class Estadisticas:
             print(f"  Duración mínima:         {np.min(arr):7.2f} s")
             print(f"  Duración máxima:         {np.max(arr):7.2f} s")
             print(f"  Desviación estándar:     {np.std(arr):7.2f} s")
+
+            dur = np.array(self.streak_list)
+            b_0_5 = int(np.sum((dur >= 0)  & (dur < 5)))
+            b_5_10 = int(np.sum((dur >= 5) & (dur < 10)))
+            b_10_30 = int(np.sum((dur >= 10) & (dur < 30)))
+            b_30_60 = int(np.sum((dur >= 30) & (dur < 60)))
+            b_60 = int(np.sum(dur >= 60))
+            total_b = max(len(dur), 1)
+            print(f"\n  Distribución de duraciones:")
+            for lbl, cnt in [("0-5s", b_0_5), ("5-10s", b_5_10),
+                             ("10-30s", b_10_30), ("30-60s", b_30_60),
+                             (">=60s", b_60)]:
+                pct = 100 * cnt / total_b
+                print(f"    {lbl:<7} {cnt:5d} ({pct:5.1f}%)  "
+                      f"{'#' * int(pct/2)}")
         if self.streak_max > 0:
             print(f"  Racha máxima:            {self.streak_max:.1f} s")
+        print(f"  Rachas ≥ 10 s:           {self.n_streaks_10}")
+        print(f"  Rachas ≥ 30 s:           {self.n_streaks_30}")
+        print(f"  Rachas ≥ 60 s:           {self.n_streaks_60}")
 
         print(f"\n[ Tiempo por modo ]")
         tot = sum(self.tiempos_modo.values()) or 1.0
@@ -356,6 +395,9 @@ class Estadisticas:
                 print(f"  Valor medio (no-cero):   {np.mean(ii_nz):+.6f} Hz")
                 print(f"  Rango:                   {np.min(ii_nz):+.6f} a "
                       f"{np.max(ii_nz):+.6f} Hz")
+            else:
+                print(f"\n[ Integrador en FIJAR ]")
+                print(f"  Desactivado (v9.7)")
 
         print(f"\n[ Comportamiento ]")
         print(f"  Transiciones de modo:    {self.n_transiciones}")
@@ -364,6 +406,35 @@ class Estadisticas:
         print(f"  Micro-ajustes de fase:   {self.n_micro_fase}")
         print(f"  Anti-oscilación:         {self.n_anti_oscilacion}")
         print(f"  Return-to-best:          {self.n_return_to_best}")
+        print(f"  Return-best en FIJAR:    {getattr(controlador,'n_return_best_fijar',0)}")
+        print(f"  HOLD en FIJAR:           {getattr(controlador,'n_hold_fijar',0)}")
+
+        if fg is not None:
+            try:
+                s = fg.stats
+                if s.get("n", 0) > 0:
+                    print(f"\n[ Latencia I/O — FG420 (write) ]")
+                    print(f"  n={s['n']}  "
+                          f"mean={s['mean_ms']:.2f}ms  "
+                          f"p50={s['p50_ms']:.2f}ms  "
+                          f"p95={s['p95_ms']:.2f}ms  "
+                          f"p99={s['p99_ms']:.2f}ms  "
+                          f"max={s['max_ms']:.2f}ms")
+            except Exception:
+                pass
+        if wt is not None:
+            try:
+                s = wt.stats
+                if s.get("n", 0) > 0:
+                    print(f"\n[ Latencia I/O — WT3000 (query) ]")
+                    print(f"  n={s['n']}  "
+                          f"mean={s['mean_ms']:.2f}ms  "
+                          f"p50={s['p50_ms']:.2f}ms  "
+                          f"p95={s['p95_ms']:.2f}ms  "
+                          f"p99={s['p99_ms']:.2f}ms  "
+                          f"max={s['max_ms']:.2f}ms")
+            except Exception:
+                pass
 
         print(f"\n[ Veredicto ]")
         if n_iter > 0:
@@ -380,7 +451,7 @@ class Estadisticas:
 
 
 # ==============================================================================
-# CONTROLADOR v9.5
+# CONTROLADOR v9.7
 # ==============================================================================
 
 class ControladorFPv9:
@@ -424,11 +495,20 @@ class ControladorFPv9:
         self.samples_since_fase = 0
         self.warned_unreachable = False
 
-        # v9.5: micro-ajuste de fase por tiempo fuera de banda
         self.cnt_fuera_fijar = 0
         self.cnt_desde_micro = 0
 
         self.f_filt = FREC_NOMINAL
+
+        # v9.7: hill-climb de fase en FIJAR
+        self.fase_paso_fijar     = FIJAR_PASO_INICIAL
+        self.signo_fase_fijar    = +1.0
+        self.fp_antes_paso       = None
+        self.dist_min_fijar      = 1e9
+        self.fase_mejor_fijar    = 0.0
+        self.fase_fp_hist_fijar  = deque(maxlen=10)
+        self.n_hold_fijar        = 0
+        self.n_return_best_fijar = 0
 
     # ------------------------------------------------------------------
     def _dist(self):
@@ -446,7 +526,6 @@ class ControladorFPv9:
         if d > 0.025: return 3.0
         return PASO_FASE_MIN
 
-    # ------------------------------------------------------------------
     def _resp(self, accion, cambio_fase=False):
         return {
             "accion": accion,
@@ -486,11 +565,24 @@ class ControladorFPv9:
                 self.cnt_fuera_fijar = 0
                 self.cnt_desde_micro = 0
                 self.integral_fijar = 0.0
+                # v9.7: reset del hill-climb
+                self.fase_paso_fijar     = FIJAR_PASO_INICIAL
+                self.signo_fase_fijar    = +1.0
+                self.fp_antes_paso       = (self.fp_suav
+                                            if self.fp_suav is not None
+                                            else FP_OBJETIVO)
+                self.dist_min_fijar      = self._dist()
+                self.fase_mejor_fijar    = self.fase_cmd
+                self.fase_fp_hist_fijar.clear()
+                self.n_hold_fijar        = 0
+                self.n_return_best_fijar = 0
 
     # ------------------------------------------------------------------
     def actualizar(self, fp_med, f_med, dt, stats):
-        if f_med is not None and FREC_MIN < f_med < FREC_MAX:
-            self.f_filt, _ = self.filtro_f.update(f_med, dt)
+        # v9.7: en FIJAR congelamos la frecuencia base
+        if not (FIJAR_FREEZE_FREQ and self.modo == "FIJAR"):
+            if f_med is not None and FREC_MIN < f_med < FREC_MAX:
+                self.f_filt, _ = self.filtro_f.update(f_med, dt)
 
         if fp_med is None:
             return self._resp("SIN_FP")
@@ -689,51 +781,28 @@ class ControladorFPv9:
 
     # ------------------------------------------------------------------
     def _fijar(self, stats, dt):
-        # v9.5: warmup para que el FP se asiente tras entrar
+        """
+        FIJAR v9.7: hill-climb decisivo sobre FASE.
+        - Sin PI de frecuencia (no tiene autoridad).
+        - Dead-zone muy estrecha (0.003).
+        - Cooldown mínimo (1 iteración).
+        - Running-best + return-to-best si nos perdemos.
+        """
+        # Warmup
         if self.cnt_fijar_warmup < N_WARMUP_FIJAR:
             self.cnt_fijar_warmup += 1
             self.delta_f = 0.0
             return self._resp(f"WARMUP_FIJAR({self.cnt_fijar_warmup})")
 
-        # PI fuerte
-        error = FP_OBJETIVO - self.fp_suav
-        self.integral_fijar += KI_FIJAR * error * dt
-        self.integral_fijar = clamp(self.integral_fijar,
-                                    -DF_FIJAR_MAX, DF_FIJAR_MAX)
-        delta_f_fino = KP_FIJAR * error + self.integral_fijar
-        self.delta_f = clamp(delta_f_fino, -DF_FIJAR_MAX, DF_FIJAR_MAX)
-
-        # Anti-windup
-        if abs(delta_f_fino) >= DF_FIJAR_MAX:
-            self.integral_fijar -= KI_FIJAR * error * dt
-
-        self.cnt_desde_micro += 1
-
+        self.delta_f = 0.0  # sin PI de frecuencia
         dist = self._dist()
 
-        # v9.5: trigger de micro-ajuste por tiempo fuera de banda
-        if dist > TOLERANCIA_FP:
-            self.cnt_fuera_fijar += 1
-        else:
-            self.cnt_fuera_fijar = 0
+        # Actualizar mejor observado
+        if dist < self.dist_min_fijar:
+            self.dist_min_fijar   = dist
+            self.fase_mejor_fijar = self.fase_cmd
 
-        if (self.cnt_fuera_fijar >= MICRO_FASE_N_FUERA and
-                self.cnt_desde_micro >= MICRO_FASE_COOLDOWN):
-            delta_fp = self.fp_suav - FP_OBJETIVO
-            signo_micro = -1.0 if delta_fp > 0 else +1.0
-            self.fase_cmd = envolver_fase(self.fase_cmd +
-                                          signo_micro * MICRO_FASE_PASO)
-            self.fase_cmd = clamp(self.fase_cmd, FASE_MIN, FASE_MAX)
-            self.n_cambios_fase += 1
-            self.samples_since_fase = 0
-            stats.n_micro_fase += 1
-            self.cnt_fuera_fijar = 0
-            self.cnt_desde_micro = 0
-            self.integral_fijar = 0.0
-            return self._resp(f"MICRO_FASE{signo_micro*MICRO_FASE_PASO:+.0f}",
-                              cambio_fase=True)
-
-        # ¿Salir de FIJAR? (muy poco probable, sticky)
+        # Salida de emergencia
         if dist > DELTA_SALIR_FIJAR:
             self.cnt_consec_fijar_fail += 1
             if self.cnt_consec_fijar_fail >= N_CONSEC_FIJAR_FAIL:
@@ -745,7 +814,79 @@ class ControladorFPv9:
         else:
             self.cnt_consec_fijar_fail = 0
 
-        return self._resp(f"FIJAR_PI{self.delta_f:+.4f}")
+        # === EVAL del último paso ===
+        if self.sub_estado == "EVAL_FASE":
+            self.cnt += 1
+            if self.cnt < FIJAR_EVAL_ITER:
+                return self._resp(f"EVAL_FIJAR({self.cnt})")
+
+            dist_antes = abs(self.fp_antes_paso - FP_OBJETIVO)
+            mejora = dist_antes - dist
+
+            stats.efecto_pruebas += 1
+            if abs(mejora) > UMBRAL_EFECTO:
+                stats.efecto_exitosas += 1
+
+            self.fase_fp_hist_fijar.append((self.fase_cmd, self.fp_suav))
+
+            if mejora > FIJAR_UMBRAL_MEJORA:
+                self.fase_paso_fijar = min(self.fase_paso_fijar * 1.4,
+                                           FIJAR_PASO_MAX)
+            elif mejora < -FIJAR_UMBRAL_MEJORA:
+                self.signo_fase_fijar *= -1.0
+                self.fase_paso_fijar = max(self.fase_paso_fijar * 0.6,
+                                           FIJAR_PASO_MIN)
+                stats.n_anti_oscilacion += 1
+            else:
+                self.fase_paso_fijar = min(self.fase_paso_fijar * 1.25,
+                                           FIJAR_PASO_MAX)
+
+            self.sub_estado = "COOLDOWN"
+            self.cnt = 0
+            return self._resp(f"EVAL_FIJAR(m={mejora:+.4f})")
+
+        # === COOLDOWN corto ===
+        if self.sub_estado == "COOLDOWN":
+            self.cnt += 1
+            if self.cnt >= FIJAR_COOLDOWN:
+                self.sub_estado = "MOVER"
+                self.cnt = 0
+            return self._resp("COOL_FIJAR")
+
+        # === MOVER ===
+        if self.sub_estado == "MOVER":
+            # Return-to-best si estamos perdidos y teníamos un buen punto
+            if (self.dist_min_fijar < 0.005
+                    and dist > self.dist_min_fijar * FIJAR_RETURN_BEST
+                    and abs(self.fase_cmd - self.fase_mejor_fijar) > 0.5):
+                self.fase_cmd = self.fase_mejor_fijar
+                self.n_cambios_fase += 1
+                self.samples_since_fase = 0
+                self.n_return_best_fijar += 1
+                stats.n_return_to_best += 1
+                self.sub_estado = "COOLDOWN"
+                self.cnt = 0
+                return self._resp("RETURN_BEST_FIJAR", cambio_fase=True)
+
+            if dist > FIJAR_ACTIVO_UMBRAL:
+                self.fp_antes_paso = self.fp_suav
+                self.fase_cmd = envolver_fase(
+                    self.fase_cmd
+                    + self.signo_fase_fijar * self.fase_paso_fijar)
+                self.fase_cmd = clamp(self.fase_cmd, FASE_MIN, FASE_MAX)
+                self.n_cambios_fase += 1
+                self.samples_since_fase = 0
+                stats.n_micro_fase += 1
+                self.sub_estado = "EVAL_FASE"
+                self.cnt = 0
+                return self._resp(
+                    f"FIJAR_MOVE{self.signo_fase_fijar*self.fase_paso_fijar:+.2f}",
+                    cambio_fase=True)
+
+            self.n_hold_fijar += 1
+            return self._resp("FIJAR_HOLD")
+
+        return self._resp("FIJAR_IDLE")
 
 
 # ==============================================================================
@@ -755,9 +896,9 @@ class ControladorFPv9:
 def encabezado():
     print("-" * 170)
     print(f"{'t':>5} | {'FP':>8} | {'FPflt':>8} | {'Fase':>8} | "
-          f"{'Δf':>9} | {'Int':>9} | {'FrecFlt':>9} | "
+          f"{'Δf':>9} | {'FrecFlt':>9} | "
           f"{'Modo':>8} | {'T.Range':>8} | {'Streak':>7} | "
-          f"{'Dist':>6} | {'Acción':>22} | Estado")
+          f"{'Dist':>6} | {'Acción':>24} | Estado")
     print("-" * 170)
 
 
@@ -773,10 +914,9 @@ def fila(t, fp_med, res, en_rango, streak, t_in_range, t_total):
     dist = abs(res["fp"] - FP_OBJETIVO)
     print(f"{t:>5} | {fp_med:>+8.4f} | {res['fp']:>+8.4f} | "
           f"{res['fase']:>+8.2f} | {res['delta_f']:>+9.5f} | "
-          f"{res.get('integral_fijar',0):>+9.6f} | "
           f"{res['frecuencia_filt']:>9.4f} | "
           f"{res['modo']:>8} | {pct_in:>6.1f}% | {streak:>6.1f}s | "
-          f"{dist:>6.4f} | {res['accion']:>22} | {estado}")
+          f"{dist:>6.4f} | {res['accion']:>24} | {estado}")
 
 
 # ==============================================================================
@@ -785,19 +925,27 @@ def fila(t, fp_med, res, en_rango, streak, t_in_range, t_total):
 
 def main():
     print("=" * 170)
-    print(" CONTROL DE FP v9.5 - OBJETIVOS + PI FUERTE + FIJAR PEGAJOSO")
+    titulo = "CONTROL DE FP v9.7 — HILL-CLIMB DECISIVO SOBRE FASE" if MODO_EXTREME \
+             else "CONTROL DE FP v9.7 — STREAMING"
+    print(f" {titulo}")
     print("=" * 170)
 
     preguntar_objetivos()
 
-    print(f"\n Muestreo: {1/INTERVALO_MUESTREO:.0f} Hz | "
-          f"PI FIJAR: Kp={KP_FIJAR}, Ki={KI_FIJAR}, sat=±{DF_FIJAR_MAX}")
+    modo_io = "EXTREME" if MODO_EXTREME else "streaming"
+    print(f"\n Modo I/O: {modo_io}")
+    if MODO_EXTREME:
+        print(f" Intervalo EXTREME:       {INTERVALO_EXTREME:.4f} s  "
+              f"({'sin sleep' if INTERVALO_EXTREME <= 0 else 'con sleep'})")
+    else:
+        print(f" Muestreo:                {1/INTERVALO_MUESTREO:.0f} Hz")
+    print(f" FIJAR: hill-climb fase (KP={KP_FIJAR}, KI={KI_FIJAR}, "
+          f"FREEZE_FREQ={FIJAR_FREEZE_FREQ})")
+    print(f" FIJAR parámetros: dead-zone={FIJAR_ACTIVO_UMBRAL}, "
+          f"cooldown={FIJAR_COOLDOWN}, eval={FIJAR_EVAL_ITER}, "
+          f"paso {FIJAR_PASO_MIN}°-{FIJAR_PASO_MAX}°")
     print(f" Objetivo: FP={FP_OBJETIVO:+.4f} ({TIPO_CARGA}) | "
           f"Banda: [{FP_MIN_RANGO:+.4f}, {FP_MAX_RANGO:+.4f}]")
-    print(f" AJUSTAR: paso_df {PASO_DF_INICIAL}→{PASO_DF_MIN}")
-    print(f" FIJAR: N_FAIL={N_CONSEC_FIJAR_FAIL}, "
-          f"DELTA_SALIR={DELTA_SALIR_FIJAR}, "
-          f"micro cada {MICRO_FASE_N_FUERA} iter fuera")
     print("=" * 170)
 
     fg = None
@@ -808,25 +956,51 @@ def main():
     total = 0
     en_rango = 0
     t_ctrl = None
+    last_freq_written = None
 
     try:
-        print("\n[1/3] Conectando equipos (streaming)...")
-        fg = YokogawaFG420(DIR_FG, mode='streaming')
-        wt = YokogawaWT3000(DIR_WT, mode='streaming')
-        fg.conectar()
-        wt.conectar()
-        print(f"  FG420:  {fg.obtener_idn()[:60]}")
-        print(f"  WT3000: {wt.obtener_idn()[:60]}")
+        if MODO_EXTREME:
+            print("\n[1/3] Conectando equipos (EXTREME)...")
+            fg = YokogawaFG420(DIR_FG, mode='extreme')
+            wt = YokogawaWT3000(DIR_WT, mode='extreme')
+            fg.conectar()
+            wt.conectar()
+            print(f"  FG420:  {fg.obtener_idn()[:60]}")
+            print(f"  WT3000: {wt.obtener_idn()[:60]}")
 
-        wt.configurar_salida_numerica_estandar(elemento_entrada=ELEMENTO_WT)
-        fg.configurar_canal_rapido(
-            canal=1, funcion="SIN",
-            frecuencia_hz=FREC_NOMINAL,
-            amplitud_vpp=AMPLITUD_FG,
-            offset_v=OFFSET_V_FG,
-            fase_grados=0.0,
-            activar_salida=True,
-        )
+            print("  ► Aplicando extreme() en FG420...")
+            fg.extreme(
+                canal=1,
+                frecuencia_hz=FREC_NOMINAL,
+                amplitud_vpp=AMPLITUD_FG,
+                offset_v=OFFSET_V_FG,
+                fase_grados=0.0,
+                encender_salida=True,
+            )
+            print("  ► Aplicando extreme() en WT3000...")
+            wt.extreme(
+                elemento_entrada=ELEMENTO_WT,
+                incluir_potencias=True,
+                configurar_salida=True,
+            )
+        else:
+            print("\n[1/3] Conectando equipos (streaming)...")
+            fg = YokogawaFG420(DIR_FG, mode='streaming')
+            wt = YokogawaWT3000(DIR_WT, mode='streaming')
+            fg.conectar()
+            wt.conectar()
+            print(f"  FG420:  {fg.obtener_idn()[:60]}")
+            print(f"  WT3000: {wt.obtener_idn()[:60]}")
+
+            wt.configurar_salida_numerica_estandar(elemento_entrada=ELEMENTO_WT)
+            fg.configurar_canal_rapido(
+                canal=1, funcion="SIN",
+                frecuencia_hz=FREC_NOMINAL,
+                amplitud_vpp=AMPLITUD_FG,
+                offset_v=OFFSET_V_FG,
+                fase_grados=0.0,
+                activar_salida=True,
+            )
 
         print("\n[2/3] Estabilizando 5 s...")
         for _ in range(10):
@@ -846,10 +1020,13 @@ def main():
             t_prev = t_now
 
             try:
-                m = wt.leer_mediciones_estandar()
+                if MODO_EXTREME:
+                    m = wt.leer_mediciones_minimas()
+                else:
+                    m = wt.leer_mediciones_estandar()
             except Exception as e:
                 print(f"[X] Error lectura: {e}")
-                time.sleep(INTERVALO_MUESTREO)
+                time.sleep(0.001)
                 continue
 
             if wt.is_outlier():
@@ -858,7 +1035,7 @@ def main():
             fp_med = m.get("factor_potencia")
             f_med = m.get("frecuencia")
             if fp_med is None or f_med is None:
-                time.sleep(INTERVALO_MUESTREO)
+                time.sleep(0.001)
                 continue
 
             fp_val = float(fp_med)
@@ -869,7 +1046,16 @@ def main():
 
             res = controlador.actualizar(fp_val, f_med, dt, stats)
 
-            fg.establecer_frecuencia_streaming(1, res["frecuencia"])
+            # v9.7: escribir frecuencia solo si cambia de verdad
+            f_out = res["frecuencia"]
+            if (last_freq_written is None
+                    or abs(f_out - last_freq_written) > FREQ_WRITE_EPS):
+                if MODO_EXTREME:
+                    fg.establecer_frecuencia_extreme(1, f_out)
+                else:
+                    fg.establecer_frecuencia_streaming(1, f_out)
+                last_freq_written = f_out
+
             if res["cambio_fase"]:
                 fg.establecer_fase(1, res["fase"])
 
@@ -888,16 +1074,24 @@ def main():
                 fila(int(t_rel), fp_val, res, en_rango_local,
                      stats.streak_actual, stats.t_in_range, t_rel)
 
-            elapsed = time.time() - t_now
-            if elapsed < INTERVALO_MUESTREO:
-                time.sleep(INTERVALO_MUESTREO - elapsed)
+            if MODO_EXTREME:
+                if INTERVALO_EXTREME > 0:
+                    elapsed = time.time() - t_now
+                    if elapsed < INTERVALO_EXTREME:
+                        time.sleep(INTERVALO_EXTREME - elapsed)
+            else:
+                elapsed = time.time() - t_now
+                if elapsed < INTERVALO_MUESTREO:
+                    time.sleep(INTERVALO_MUESTREO - elapsed)
 
-        stats.resumen(controlador, time.time() - t_ctrl, total, en_rango)
+        stats.resumen(controlador, time.time() - t_ctrl,
+                      total, en_rango, fg=fg, wt=wt)
 
     except KeyboardInterrupt:
         print("\n\n[!] Detenido por usuario.")
         if total > 0 and t_ctrl is not None:
-            stats.resumen(controlador, time.time() - t_ctrl, total, en_rango)
+            stats.resumen(controlador, time.time() - t_ctrl,
+                          total, en_rango, fg=fg, wt=wt)
 
     except Exception as e:
         print(f"\n[X] Error fatal: {e}")

@@ -2,6 +2,8 @@
 Controlador mejorado para el generador de ondas Yokogawa FG420.
 
 Modos:
+    - 'extreme'  : sleeps a 0, sin OPC, sin queries. Latencia mínima absoluta.
+                   Configuración one-shot + writes crudos en el lazo.
     - 'streaming': sleeps a 0, sin OPC. Para el lazo de control (PLL).
     - 'fast'     : sleeps ~1-2 ms, sin OPC. Adquisición rápida no crítica.
     - 'balanced' : sleeps ~5 ms, sin OPC. Uso general.
@@ -17,7 +19,7 @@ import pyvisa
 
 
 class YokogawaFG420:
-    MODOS_VALIDOS = ('streaming', 'fast', 'balanced', 'precise')
+    MODOS_VALIDOS = ('extreme', 'streaming', 'fast', 'balanced', 'precise')
 
     def __init__(self, resource_address: str, timeout: int = 5000,
                  mode: str = 'balanced', sleep_scale: float = 1.0):
@@ -40,7 +42,12 @@ class YokogawaFG420:
         if mode not in self.MODOS_VALIDOS:
             raise ValueError(f"Modo debe ser uno de {self.MODOS_VALIDOS}")
         self.mode = mode
-        if mode == 'streaming':
+        if mode == 'extreme':
+            self._write_sleep_base = 0.0
+            self._query_sleep_base = 0.0
+            self.use_opc = False
+            self.use_chaining = True
+        elif mode == 'streaming':
             self._write_sleep_base = 0.0
             self._query_sleep_base = 0.0
             self.use_opc = False
@@ -262,6 +269,49 @@ class YokogawaFG420:
         """
         Escritura cruda de frecuencia para el lazo. Sin sleep, sin OPC.
         Es el único comando que debe ejecutarse en el bucle del PLL.
+        """
+        self._check_canal(canal)
+        self._write_raw(f":SOURce{canal}:FREQuency {frecuencia_hz:.6f}")
+
+    # ------------------------------------------------------------------ #
+    # Modo EXTREME — latencia mínima absoluta
+    # ------------------------------------------------------------------ #
+    def extreme(self, canal: int = 1, frecuencia_hz: float = 60.0,
+                amplitud_vpp: float = 5.0, offset_v: float = 0.0,
+                fase_grados: float = 0.0, encender_salida: bool = True) -> None:
+        """
+        Lleva el FG420 al límite: latencia mínima absoluta.
+
+        Diferencias con 'streaming':
+            - Fuerza sleep_scale = 0.0 (anula cualquier escala previa).
+            - Emite *CLS + configuración completa en UN ÚNICO write.
+            - No ejecuta ninguna query (ni *IDN?, ni *OPC?, ni estado).
+            - Usa :FUNCtion SIN y precisión suficiente para el lazo.
+
+        Pensado para ejecutarse UNA vez al entrar en el lazo de control.
+        Después, en cada iteración, llama solo a
+        `establecer_frecuencia_extreme()` (o `_streaming`, equivalente).
+        """
+        # 1) Modo extreme + sleep_scale = 0
+        self.set_mode('extreme', sleep_scale=0.0)
+        self._check_canal(canal)
+
+        # 2) Todo en un único write (sin sleeps, sin OPC, sin queries)
+        on_off = "ON" if encender_salida else "OFF"
+        cmd = (f"*CLS;"
+               f":SOURce{canal}:FUNCtion SIN;"
+               f":SOURce{canal}:FREQuency {frecuencia_hz:.6f};"
+               f":SOURce{canal}:VOLTage {amplitud_vpp:.4f}VPP;"
+               f":SOURce{canal}:VOLTage:OFFSet {offset_v:.4f}V;"
+               f":SOURce{canal}:PHASe {fase_grados:.4f};"
+               f":OUTPut{canal} {on_off}")
+        self._write_raw(cmd)
+
+    def establecer_frecuencia_extreme(self, canal: int, frecuencia_hz: float) -> None:
+        """
+        Write crudo de frecuencia para el lazo en modo extreme.
+        Sin sleeps, sin OPC, sin queries. Es el único comando que debe
+        ejecutarse dentro del bucle del PLL.
         """
         self._check_canal(canal)
         self._write_raw(f":SOURce{canal}:FREQuency {frecuencia_hz:.6f}")

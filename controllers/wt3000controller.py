@@ -2,6 +2,8 @@
 Controlador mejorado para el analizador de potencia Yokogawa WT3000.
 
 Modos:
+    - 'extreme'  : sleeps a 0, avg_count=1, sin filtros. Salida numérica
+                   reducida al mínimo. Latencia mínima absoluta.
     - 'streaming': sleeps a 0. Para el lazo de control (PLL).
                    avg_count=1, sin filtros. Latencia mínima.
     - 'fast'     : sleeps ~2 ms, avg_count=1. Adquisición rápida.
@@ -17,7 +19,7 @@ import pyvisa
 
 
 class YokogawaWT3000:
-    MODOS_VALIDOS = ('streaming', 'fast', 'balanced', 'precise')
+    MODOS_VALIDOS = ('extreme', 'streaming', 'fast', 'balanced', 'precise')
 
     # Ítems numéricos usados por la salida mínima del lazo
     # (PHI: ángulo de fase, FU: frecuencia, LAMBda: factor de potencia)
@@ -39,6 +41,7 @@ class YokogawaWT3000:
 
         # Flag: modo de salida numérica configurada ('estandar' o 'minima')
         self._salida_config = None
+        self._min_items = []
 
     # ------------------------------------------------------------------ #
     # Configuración de modo
@@ -47,7 +50,14 @@ class YokogawaWT3000:
         if mode not in self.MODOS_VALIDOS:
             raise ValueError(f"Modo debe ser uno de {self.MODOS_VALIDOS}")
         self.mode = mode
-        if mode == 'streaming':
+        if mode == 'extreme':
+            self._write_sleep_base = 0.0
+            self._query_sleep_base = 0.0
+            self.avg_count = 1
+            self.sync_source = "LINE"
+            self.line_filter = False
+            self.freq_filter = False
+        elif mode == 'streaming':
             self._write_sleep_base = 0.0
             self._query_sleep_base = 0.0
             self.avg_count = 1
@@ -229,6 +239,7 @@ class YokogawaWT3000:
         self.escribir(f":NUMeric:ITEM11 PHI,{elem}")
         self.escribir(f":NUMeric:ITEM12 FU,{elem}")
         self._salida_config = "estandar"
+        self._min_items = []
 
     def configurar_salida_minima(self, elemento_entrada: int = 1,
                                  incluir_potencias: bool = True):
@@ -246,6 +257,37 @@ class YokogawaWT3000:
             self.escribir(f":NUMeric:ITEM{i} {it},{elem}")
         self._salida_config = "minima"
         self._min_items = items
+
+    # ------------------------------------------------------------------ #
+    # Modo EXTREME — latencia mínima absoluta
+    # ------------------------------------------------------------------ #
+    def extreme(self, elemento_entrada: int = 1,
+                incluir_potencias: bool = False,
+                configurar_salida: bool = True) -> None:
+        """
+        Lleva el WT3000 al límite: latencia mínima absoluta.
+
+        Acciones:
+            - Cambia a modo 'extreme' (sleeps=0, avg_count=1, sin filtros,
+              sync=LINE).
+            - Aplica la configuración WT al instrumento (vía set_mode).
+            - Configura la salida numérica mínima:
+                * Si incluir_potencias=False -> solo PHI, FU (2 valores).
+                * Si incluir_potencias=True  -> PHI, FU, LAMBda, P, Q.
+            - No ejecuta queries adicionales (no *IDN?, no errores).
+
+        Pensado para ejecutarse UNA vez al entrar en el lazo. Después,
+        en cada iteración, usa solo `leer_mediciones_minimas()`.
+        """
+        # 1) Modo extreme + sleep_scale = 0
+        self.set_mode('extreme', sleep_scale=0.0)
+
+        # 2) Salida numérica reducida al mínimo imprescindible
+        if configurar_salida:
+            self.configurar_salida_minima(
+                elemento_entrada=elemento_entrada,
+                incluir_potencias=incluir_potencias,
+            )
 
     # ------------------------------------------------------------------ #
     # Lectura estándar (compatibilidad)
@@ -279,12 +321,13 @@ class YokogawaWT3000:
         """
         Devuelve solo lo que el PLL necesita: ángulo de fase, frecuencia y
         (si se configuró con incluir_potencias=True) LAMBda, P, Q.
-        Requiere haber llamado a configurar_salida_minima() antes.
+        Requiere haber llamado a configurar_salida_minima() o extreme()
+        antes.
         """
         if self._salida_config != "minima":
             raise RuntimeError(
-                "Debes llamar a configurar_salida_minima() antes de usar "
-                "leer_mediciones_minimas().")
+                "Debes llamar a configurar_salida_minima() o extreme() "
+                "antes de usar leer_mediciones_minimas().")
         data_raw = self._query_raw(":NUMeric:VALue?")
         if self.query_sleep > 0:
             time.sleep(self.query_sleep)
