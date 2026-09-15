@@ -1,0 +1,20 @@
+{
+  "comunes": {
+    "DIR_FG": "GPIB1::2::INSTR",
+    "DIR_WT": "GPIB0::1::INSTR",
+    "ELEMENTO_WT": 1,
+    "TIEMPO_SEG": 300,
+    "INTERVALO_S": 0.05,
+    "AMPLITUD_VPP": 5.0,
+    "FREC_HZ": 60.0
+  },
+  "perfiles": {
+    "pf_1_0":   {"FP": 1.000, "TOL_FP": 0.020, "K": 1.00, "PASO_MAX": 25.0, "PHI_ENTER": 15.0, "PHI_EXIT": 5.0,   "OUTLIER": 40.0, "PHI_FILTER": 1, "DF_LP": 0.30},
+    "pf_0_5":   {"FP": 0.500, "TOL_FP": 0.010, "K": 0.10, "PASO_MAX": 30.0, "PHI_ENTER": 50.0, "PHI_EXIT": 25.0,  "OUTLIER": 35.0, "PHI_FILTER": 6, "DF_LP": 0.10},
+    "pf_0_2":   {"FP": 0.200, "TOL_FP": 0.030, "K": 0.12, "PASO_MAX": 25.0, "PHI_ENTER": 10.0, "PHI_EXIT": 5.0,   "OUTLIER": 30.0, "PHI_FILTER": 6, "DF_LP": 0.12},
+    "pf_0_1":   {"FP": 0.100, "TOL_FP": 0.030, "K": 0.15, "PASO_MAX": 20.0, "PHI_ENTER": 8.0,  "PHI_EXIT": 3.5,   "OUTLIER": 20.0, "PHI_FILTER": 5, "DF_LP": 0.15},
+    "pf_0_05":  {"FP": 0.050, "TOL_FP": 0.020, "K": 0.18, "PASO_MAX": 15.0, "PHI_ENTER": 6.0,  "PHI_EXIT": 2.5,   "OUTLIER": 15.0, "PHI_FILTER": 4, "DF_LP": 0.18},
+    "pf_0_01":  {"FP": 0.010, "TOL_FP": 0.005, "K": 0.24, "PASO_MAX": 10.0, "PHI_ENTER": 3.0,  "PHI_EXIT": 1.0,   "OUTLIER": 12.0, "PHI_FILTER": 3, "DF_LP": 0.25},
+    "pf_0_001": {"FP": 0.001, "TOL_FP": 0.001, "K": 0.15, "PASO_MAX": 5.0,  "PHI_ENTER": 0.5,  "PHI_EXIT": 0.15,  "OUTLIER": 5.0,  "PHI_FILTER": 3, "DF_LP": 0.20}
+  }
+}
