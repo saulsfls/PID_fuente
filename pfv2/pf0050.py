@@ -1,29 +1,17 @@
 """
-CONTROL DE FACTOR DE POTENCIA v11.26-005
+CONTROL DE FACTOR DE POTENCIA v11.27-006
 --------------------------------------------------------------------------------
 Objetivo: FP = 0.0500  (φ_obj ≈ 87.1340°)
 Instrumentación: Yokogawa FG420 + Yokogawa WT3000 (vía GPIB)
 
-Base: v11.24-005 (71.3% en ±0.02, lastrado por arranque de 7s con BUSCAR
-en dirección opuesta).
-
-DIAGNÓSTICO DEL LOG v11.24-005:
-  - BUSCAR arranca yendo en dirección OPUESTA: FP sube de 0.18 a 0.99 y
-    luego baja a 0.05. ~7s perdidos + sesgo global +0.09.
-  - El signo de dφ_meas/dfase_cmd CAMBIA con el punto de operación del FG420
-    (positivo cerca de φ_meas≈80°, negativo cerca de φ_meas≈87°).
-
-CAMBIOS v11.26-005:
-  - SONDA DE SIGNO en BUSCAR: aplica un paso acotado (±4°), espera 2 muestras
-    frescas, y si |err| creció > 2.5° invierte el signo para todo el BUSCAR.
-  - BUSCAR timeout (6s) fuerza transición a PLL si no converge.
-  - Slope clip ampliado a [-1.5, +1.5] (permite signo positivo).
-  - Reset limpio al entrar a PLL: integral=0, error_filt=error_fresh,
-    slope = SLOPE_INIT (correcto cerca del objetivo).
-  - Al volver de PLL a BUSCAR, se re-sondea el signo.
-  - KI_PHI_VEL 1.00 (sin cambio), KP_PHI_VEL 0.55 (sin cambio).
-  - PHI_BUSCAR_ENTER 8.0° con 5 muestras (sin cambio).
-  - df = 0 SIEMPRE (frecuencia fija a 60.000 Hz).
+CAMBIOS v11.27-006:
+  - FIX CRÍTICO: El PLL ahora respeta el signo de la pendiente (slope) incluso 
+    si su magnitud cae por debajo de SLOPE_MIN_ABS, apoyándose en buscar_sign.
+  - Sintonización más suave del PI: KP baja a 0.25, KI baja a 0.40 para reducir 
+    el "chattering" violento detectado (1200+ trims en 3 mins).
+  - Reducción de SLOPE_MIN_ABS a 0.15 (el log anterior mostró slope real de 0.204).
+  - Estadísticas Avanzadas: Cálculo de RMSE, estadísticas aisladas para el 
+    estado de PLL, tasa de trims/seg, y conteo de cruces por cero (oscilaciones).
 --------------------------------------------------------------------------------
 """
 
@@ -38,7 +26,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from controllers.fg420controllerv2 import YokogawaFG420
 from controllers.wt3000controllerv2 import YokogawaWT3000
 
-# ==================== CONFIGURACIÓN Y CONSTANTES v11.26-005 ====================
+# ==================== CONFIGURACIÓN Y CONSTANTES ====================
 DIR_FG, DIR_WT = "GPIB1::2::INSTR", "GPIB0::1::INSTR"
 ELEMENTO_WT = 1
 TIEMPO_PRUEBA_SEG = 300
@@ -68,15 +56,15 @@ PROBE_WAIT_SAMPLES = 2       # muestras frescas a esperar tras la sonda
 PROBE_FLIP_MARGIN  = 2.5     # ° — si |err| crece más que esto, invierte
 BUSCAR_TIMEOUT_SEC = 6.0     # s — fuerza PLL si BUSCAR no converge
 
-# --- Pendiente (BUSCAR: fija con signo adaptable; PLL: adaptativa) ---
+# --- Pendiente ---
 SLOPE_FIXED_BUSCAR = -1.00
-SLOPE_INIT, SLOPE_MIN_ABS, SLOPE_SAMPLES_INIT = -0.80, 0.30, 25
-SLOPE_CLIP_LOW, SLOPE_CLIP_HIGH = -1.50, +1.50   # ahora permite positivo
+SLOPE_INIT, SLOPE_MIN_ABS, SLOPE_SAMPLES_INIT = -0.80, 0.15, 25  # MIN_ABS bajado a 0.15
+SLOPE_CLIP_LOW, SLOPE_CLIP_HIGH = -1.50, +1.50
 SLOPE_ADAPT_W = 0.12
 
-# --- Control PI (solo fase; df=0) ---
-KP_PHI_VEL = 0.55
-KI_PHI_VEL = 1.00
+# --- Control PI (solo fase; df=0) suavizado ---
+KP_PHI_VEL = 0.25   # Reducido de 0.55
+KI_PHI_VEL = 0.40   # Reducido de 1.00
 INTEGRAL_CMD_LIMIT   = 2.00
 INTEGRAL_ENABLE_BAND = 2.00
 INTEGRAL_RESET_TRIM  = 0.90
@@ -91,7 +79,7 @@ MAX_OUTLIERS_CONSEC = 5
 
 # --- Trim de fase ---
 PHI_TRIM_DEADBAND     = 0.15
-PHI_TRIM_MAX          = 2.20
+PHI_TRIM_MAX          = 1.20  # Reducido de 2.20 para evitar saltos agresivos
 PHI_TRIM_MIN          = 0.05
 N_FRESH_COOLDOWN_TRIM = 1
 
@@ -104,31 +92,51 @@ def error_fase(phi_deg): return envolver_fase(phi_deg - PHI_OBJETIVO)
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 
-# ==================== ESTADÍSTICAS ====================
+# ==================== ESTADÍSTICAS AVANZADAS ====================
 class Stats:
     BANDS = [0.005, 0.01, 0.02, 0.03]
 
     def __init__(self):
         self.fp_hist, self.fp_err_hist, self.phi_err_hist = [], [], []
+        self.fp_pll_hist = []  # Exclusivo para métricas estables
+        
         self.times_mode = {"BUSCAR": 0.0, "PLL": 0.0}
         self.t_total = 0.0
         self.n_total = 0
         self.n_fresh = self.n_stale = self.n_outliers = 0
+        
         self.n_trims = 0
         self.trims_phi_delta = []
+        
         self.t_in_band    = {b: 0.0  for b in self.BANDS}
         self.t_first_band = {b: None for b in self.BANDS}
+        
+        # Detección de oscilaciones
+        self.last_err_sign = None
+        self.zero_crossings = 0
 
     def registrar(self, fp, phi_err, modo, dt):
         self.t_total += dt
         self.n_total += 1
         self.fp_hist.append(fp)
-        fp_err = abs(fp - FP_OBJETIVO)
-        self.fp_err_hist.append(fp_err)
+        
+        fp_err = fp - FP_OBJETIVO
+        self.fp_err_hist.append(abs(fp_err))
         self.phi_err_hist.append(abs(phi_err))
+        
+        # Conteo de oscilaciones (cruces por cero del error de FP)
+        current_sign = 1 if fp_err > 0 else -1 if fp_err < 0 else 0
+        if self.last_err_sign is not None and current_sign != 0 and current_sign != self.last_err_sign:
+            self.zero_crossings += 1
+        self.last_err_sign = current_sign if current_sign != 0 else self.last_err_sign
+
         self.times_mode[modo] = self.times_mode.get(modo, 0.0) + dt
+        
+        if modo == "PLL":
+            self.fp_pll_hist.append(fp)
+
         for b in self.BANDS:
-            if fp_err <= b:
+            if abs(fp_err) <= b:
                 self.t_in_band[b] += dt
                 if self.t_first_band[b] is None:
                     self.t_first_band[b] = self.t_total
@@ -139,7 +147,7 @@ class Stats:
 
     def resumen(self, ctrl):
         print("\n" + "=" * 78)
-        print(f" RESUMEN DE DIAGNÓSTICO v11.26-005 — Objetivo FP={FP_OBJETIVO} "
+        print(f" RESUMEN DE DIAGNÓSTICO v11.27-006 — Objetivo FP={FP_OBJETIVO} "
               f"(φ_obj={PHI_OBJETIVO:.4f}°)")
         print("=" * 78)
         print(f"\n[ Datos Base ]  T={self.t_total:.1f}s  N={self.n_total}  "
@@ -148,13 +156,24 @@ class Stats:
         if self.fp_hist:
             media_fp = np.mean(self.fp_hist)
             sesgo = media_fp - FP_OBJETIVO
-            print(f"[ Control FP ]  media={media_fp:.4f}  std={np.std(self.fp_hist):.4f}  "
-                  f"sesgo (offset)={sesgo:+.4f}  |FP-{FP_OBJETIVO}| med={np.median(self.fp_err_hist):.4f}")
+            rmse = np.sqrt(np.mean(np.square(np.array(self.fp_hist) - FP_OBJETIVO)))
+            print(f"[ Control Global ]  media={media_fp:.4f}  std={np.std(self.fp_hist):.4f}  "
+                  f"sesgo={sesgo:+.4f}  RMSE={rmse:.4f}")
+            
+        if self.fp_pll_hist:
+            pll_mean = np.mean(self.fp_pll_hist)
+            pll_std = np.std(self.fp_pll_hist)
+            print(f"[ Estabilidad PLL ] media={pll_mean:.4f}  std={pll_std:.4f}  "
+                  f"(Filtrado sin fase BUSCAR)")
 
-        print(f"\n[ Distribución de Modos ]")
+        print(f"\n[ Distribución de Modos y Estabilidad ]")
         for m, t in self.times_mode.items():
             pct_m = (t / max(self.t_total, 1e-6)) * 100
             print(f"   {m:<8} : {t:6.1f}s ({pct_m:5.1f}%)")
+            
+        tasa_trims = self.n_trims / max(self.times_mode.get("PLL", 1), 1e-6)
+        print(f"   Trims en PLL : {self.n_trims} intervenciones ({tasa_trims:.2f} trims/seg) - Medio |Δφ|: {(np.mean(self.trims_phi_delta) if self.trims_phi_delta else 0.0):.2f}°")
+        print(f"   Oscilaciones : {self.zero_crossings} cruces por el objetivo")
 
         print(f"\n[ Tiempo en banda |FP-{FP_OBJETIVO}| ]")
         for b in self.BANDS:
@@ -166,18 +185,17 @@ class Stats:
         pct_t = 100 * self.t_in_band[0.02] / max(self.t_total, 1e-6)
         v = ("EXCELENTE (>=85%)" if pct_t >= 85 else "BUENO" if pct_t >= 50 else "NECESITA AJUSTE")
         print(f"\n[ Veredicto ]  {v}  (±0.02: {pct_t:.1f}%)")
-        print(f"[ Trims aplicados ]  n={self.n_trims}  "
-              f"|Δφ| medio={(np.mean(self.trims_phi_delta) if self.trims_phi_delta else 0.0):.2f}°")
+        
         if ctrl is not None:
-            print(f"[ Pendiente final ]  s={ctrl.slope:+.3f}  (muestras={ctrl.slope_samples})")
-            print(f"[ Signo BUSCAR ]  {ctrl.buscar_sign:+.0f}  "
-                  f"(sondas realizadas={ctrl.n_probes})")
-            print(f"[ Integrador fase ]  integral_cmd={ctrl.integral_cmd:+.3f}°")
-            print(f"[ fase_cmd final ]  {ctrl.fase_cmd:+.3f}°")
+            print(f"[ Parámetros Internos ]")
+            print(f"   Pendiente final  : {ctrl.slope:+.3f} (muestras={ctrl.slope_samples})")
+            print(f"   Signo BUSCAR     : {ctrl.buscar_sign:+.0f} (sondas={ctrl.n_probes})")
+            print(f"   Integrador (I)   : {ctrl.integral_cmd:+.3f}°")
+            print(f"   Fase_cmd final   : {ctrl.fase_cmd:+.3f}°")
         print("=" * 78)
 
 
-# ==================== CONTROLADOR v11.26-005 ====================
+# ==================== CONTROLADOR ====================
 class ControladorFP:
     def __init__(self):
         self.fase_cmd = 0.0
@@ -206,7 +224,7 @@ class ControladorFP:
         self.integral_cmd = 0.0
 
         # --- Sonda de signo ---
-        self.buscar_sign = +1.0            # multiplicador del slope fijo
+        self.buscar_sign = +1.0            
         self.probe_started = False
         self.probe_done = False
         self.probe_err_before = 0.0
@@ -297,18 +315,17 @@ class ControladorFP:
         self.fresh_exit_buscar = 0
 
         if modo == "BUSCAR":
-            # Reset sonda para nueva entrada
             self.probe_started = False
             self.probe_done = False
             self.probe_counter = 0
             self.buscar_start_time = time.time()
             self.buscar_timeout_triggered = False
         elif modo == "PLL":
-            # Arranque limpio del PLL
             self.integral_cmd = 0.0
             self.error_filt = self.error_fresh
-            # SLOPE_INIT es correcto cerca del objetivo (log muestra slope<0 allí)
-            self.slope = SLOPE_INIT
+            # Heredamos el mejor signo conocido al entrar a PLL
+            if self.slope is not None and (self.slope * self.buscar_sign) < 0:
+                self.slope = SLOPE_INIT * self.buscar_sign
 
     def actualizar(self, fp, phi_med, dt, stats):
         if phi_med is None: return self._r("SIN_PHI")
@@ -336,7 +353,6 @@ class ControladorFP:
     def _buscar(self, fresh):
         if not fresh: return self._r("BUSCAR-stale")
 
-        # --- Timeout de BUSCAR ---
         if (not self.buscar_timeout_triggered
                 and time.time() - self.buscar_start_time > BUSCAR_TIMEOUT_SEC):
             self.buscar_timeout_triggered = True
@@ -349,32 +365,27 @@ class ControladorFP:
         err = self.error_fresh
         s_eff = SLOPE_FIXED_BUSCAR * self.buscar_sign
 
-        # ---------- FASE 1: SONDA DE SIGNO ----------
         if not self.probe_done:
             if not self.probe_started:
-                # Iniciar sonda
                 self.probe_started = True
                 self.probe_err_before = err
                 self.probe_counter = 0
                 self.n_probes += 1
                 d = -err / s_eff
                 if abs(d) < PROBE_STEP_DEG * 0.5:
-                    # Asegurar sonda de amplitud clara
                     d = PROBE_STEP_DEG * (1.0 if d >= 0 else -1.0)
                 d = clamp(d, -PROBE_STEP_DEG, PROBE_STEP_DEG)
                 cambio = self._mover_fase(d)
                 return self._r(f"BUSCAR-probe φ{d:+.1f}°", cambio_fase=cambio, fresh=True)
             else:
-                # Esperar muestras frescas tras el movimiento
                 if not self.fresh_after_move:
                     return self._r("BUSCAR-probe-espera")
                 self.probe_counter += 1
                 if self.probe_counter < PROBE_WAIT_SAMPLES:
                     return self._r(f"BUSCAR-probe-wait({self.probe_counter})")
-                # Evaluar
+                
                 err_after = err
                 err_before = self.probe_err_before
-                # Solo flipea si el signo del error se mantiene
                 mismo_signo = (err_after * err_before) >= 0
                 delta_err = abs(err_after) - abs(err_before)
                 if mismo_signo and delta_err > PROBE_FLIP_MARGIN:
@@ -387,7 +398,6 @@ class ControladorFP:
                     return self._r(f"BUSCAR-signo OK ({self.buscar_sign:+.0f})",
                                    cambio_fase=False, fresh=True)
 
-        # ---------- FASE 2: BUSCAR NORMAL ----------
         s_eff = SLOPE_FIXED_BUSCAR * self.buscar_sign
         d = -err / s_eff
         d = clamp(d, -PASO_BUSCAR_MAX, PASO_BUSCAR_MAX)
@@ -398,7 +408,18 @@ class ControladorFP:
         self.delta_f = 0.0
 
         if fresh:
-            s = self.slope if (self.slope and abs(self.slope) > SLOPE_MIN_ABS) else SLOPE_FIXED_BUSCAR
+            # FIX CRÍTICO: Respetar la dirección descubierta si la magnitud de pendiente es dudosa
+            s_val = self.slope if self.slope is not None else (SLOPE_FIXED_BUSCAR * self.buscar_sign)
+            
+            if abs(s_val) < SLOPE_MIN_ABS:
+                s_sign = 1.0 if s_val >= 0 else -1.0
+                # Si el signo discrepa de la sonda comprobada, prevalece la sonda
+                if s_val * self.buscar_sign < 0: 
+                    s_sign = self.buscar_sign
+                s = SLOPE_MIN_ABS * s_sign
+            else:
+                s = s_val
+
             err = self.error_fresh
             err_f = self.error_filt
             eff_dt = max(min(self.dt_since_fresh, EFF_DT_MAX), 0.05)
@@ -436,7 +457,7 @@ class ControladorFP:
 # ==================== MAIN ====================
 def main():
     print("=" * 78)
-    print(f" CONTROL FP v11.26-005 — Objetivo FP={FP_OBJETIVO} "
+    print(f" CONTROL FP v11.27-006 — Objetivo FP={FP_OBJETIVO} "
           f"(φ_obj={PHI_OBJETIVO:.4f}°)")
     print("=" * 78)
     fg = wt = None
