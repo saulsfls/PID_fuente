@@ -1,16 +1,28 @@
-"""CONTROL DE FP v11.10 — Estabilización de sesgo y ajuste fino de banda muerta"""
+"""CONTROL DE FP v11.10 — Estabilización de sesgo y ajuste fino de banda muerta (Objetivo: PF = 0.2)
+=======================================================================================================
+Integración con estadisticas.py:
+  - Al inicio pregunta si recopilar estadísticas robustas.
+  - En cada muestra se envían los datos al módulo.
+  - Al final (fin normal / Ctrl+C / excepción) se imprime el reporte,
+    se pregunta si guardar y se guarda en Excel.
+"""
 import time
 import numpy as np
 import sys
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+
 from controllers.fg420controller import YokogawaFG420
 from controllers.wt3000controller import YokogawaWT3000
+
+# --- Módulo de estadísticas robustas ---
+from estadisticas import solicitar_estadisticas, finalizar_seguro
 
 # ==================== CONFIGURACIÓN Y CONSTANTES ====================
 DIR_FG, DIR_WT = "GPIB1::2::INSTR", "GPIB0::1::INSTR"
 ELEMENTO_WT = 1
-TIEMPO_PRUEBA_SEG = 300
+TIEMPO_PRUEBA_SEG = 100
 INTERVALO_MUESTREO = 0.09  # ~11 muestras/s para frescura óptima en GPIB
 
 PHI_OBJETIVO = 78.46
@@ -19,6 +31,12 @@ FP_OBJETICO  = FP_OBJETIVO  # Alias preventivo por compatibilidad
 FP_MIN_RANGO, FP_MAX_RANGO  = 0.17, 0.23
 FP_TIGHT_LOW, FP_TIGHT_HIGH = 0.19, 0.21
 PHI_TIGHT = 0.58
+
+# --- Tolerancias para el módulo de estadísticas ---
+# Banda objetivo: ±0.02 (10% de FP=0.2)
+# Banda fina:     ±0.01 ( 5% de FP=0.2)
+TOL_OBJETIVO = 0.02
+TOL_FINA     = 0.01
 
 AMPLITUD_FG, OFFSET_V_FG = 5.0, 0.0
 FASE_MIN, FASE_MAX = -180.0, 180.0
@@ -31,7 +49,7 @@ N_SETTLE_BUSCAR = 15
 
 # Ganancias y parámetros dinámicos optimizados v11.10
 SLOPE_INIT, SLOPE_MIN_ABS, SLOPE_SAMPLES_INIT = -0.7, 0.25, 25
-KP_PLL, KI_PLL = 0.0045, 0.0040  
+KP_PLL, KI_PLL = 0.0045, 0.0040
 DF_MAX, DF_LP  = 0.10, 0.35
 
 STALE_TOL, STALE_FORCE_SEC = 0.05, 0.3
@@ -52,7 +70,7 @@ def error_fase(phi_deg): return envolver_fase(phi_deg - PHI_OBJETIVO)
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 
-# ==================== ESTADÍSTICAS Y DIAGNÓSTICO ====================
+# ==================== ESTADÍSTICAS Y DIAGNÓSTICO (local) ====================
 class Stats:
     BANDS = [0.01, 0.02, 0.03, 0.05]
 
@@ -86,25 +104,31 @@ class Stats:
         self.n_trims += 1
         self.trims_phi_delta.append(abs(dphi))
 
-    def resumen(self, ctrl):
+    def resumen(self, ctrl=None):
         print("\n" + "=" * 78)
         print(f" RESUMEN DE DIAGNÓSTICO Y ESTADÍSTICAS v11.10 — Objetivo FP={FP_OBJETIVO}")
         print("=" * 78)
         print(f"\n[ Datos Base ]  T={self.t_total:.1f}s  N={self.n_total}  "
-              f"frescas={self.n_fresh}  stale={self.n_stale}  outliers={self.n_outliers}")
-        
+              f"frescas={self.n_fresh}  stale={self.n_stale}  "
+              f"outliers={self.n_outliers}")
+
         if self.fp_hist:
             media_fp = np.mean(self.fp_hist)
             sesgo = media_fp - FP_OBJETIVO
             print(f"[ Control FP ]  media={media_fp:.4f}  std={np.std(self.fp_hist):.4f}  "
-                  f"sesgo (offset)={sesgo:+.4f}  |FP-0.2| med={np.median(self.fp_err_hist):.4f}")
+                  f"sesgo (offset)={sesgo:+.4f}  "
+                  f"|FP-{FP_OBJETIVO}| med={np.median(self.fp_err_hist):.4f}  "
+                  f"trims={self.n_trims}")
+            if self.trims_phi_delta:
+                print(f"[ Trims ]  |dφ| medio={np.mean(self.trims_phi_delta):.3f}°  "
+                      f"max={np.max(self.trims_phi_delta):.3f}°")
 
         print(f"\n[ Distribución de Modos ]")
         for m, t in self.times_mode.items():
             pct_m = (t / max(self.t_total, 1e-6)) * 100
             print(f"   {m:<8} : {t:6.1f}s ({pct_m:5.1f}%)")
 
-        print(f"\n[ Tiempo en banda |FP-0.2| ]")
+        print(f"\n[ Tiempo en banda |FP-{FP_OBJETIVO}| ]")
         for b in self.BANDS:
             pct = 100 * self.t_in_band[b] / max(self.t_total, 1e-6)
             t1 = self.t_first_band[b]
@@ -112,7 +136,8 @@ class Stats:
             print(f"   ±{b:.2f}   {pct:5.1f}%   1er: {t1_str}   {'#' * int(pct / 2)}")
 
         pct_t = 100 * self.t_in_band[0.02] / max(self.t_total, 1e-6)
-        v = ("EXCELENTE (>=80%)" if pct_t >= 80 else "BUENO" if pct_t >= 50 else "NECESITA AJUSTE")
+        v = ("EXCELENTE (>=80%)" if pct_t >= 80
+             else "BUENO" if pct_t >= 50 else "NECESITA AJUSTE")
         print(f"\n[ Veredicto ]  {v}  (±0.02: {pct_t:.1f}%)")
         print("=" * 78)
 
@@ -231,14 +256,16 @@ class ControladorFP:
         self.dt_since_fresh = 0.0 if fresh else self.dt_since_fresh + dt
         stats.n_fresh += 1 if fresh else 0
         stats.n_stale += 0 if fresh else 1
-        
+
         if fresh:
             self.cooldown_trim = max(0, self.cooldown_trim - 1)
-            
+
         self._slope()
         if fresh:
-            self.fresh_enter_buscar = (self.fresh_enter_buscar + 1 if abs(self.error_fresh) > PHI_BUSCAR_ENTER else 0)
-            self.fresh_exit_buscar = (self.fresh_exit_buscar + 1 if abs(self.error_fresh) < PHI_BUSCAR_EXIT else 0)
+            self.fresh_enter_buscar = (self.fresh_enter_buscar + 1
+                                       if abs(self.error_fresh) > PHI_BUSCAR_ENTER else 0)
+            self.fresh_exit_buscar = (self.fresh_exit_buscar + 1
+                                      if abs(self.error_fresh) < PHI_BUSCAR_EXIT else 0)
         if self.modo == "PLL" and self.fresh_enter_buscar >= N_FRESH_ENTER_BUSCAR:
             self._cambiar("BUSCAR")
         elif self.modo == "BUSCAR" and self.fresh_exit_buscar >= N_FRESH_EXIT_BUSCAR:
@@ -255,29 +282,35 @@ class ControladorFP:
             if cambio: self.calib_done = True
             return self._r(f"CALIB φ{d:+.0f}°", cambio_fase=cambio, fresh=True)
         err = self.error_fresh
-        d = -err / self.slope if (self.slope and abs(self.slope) > SLOPE_MIN_ABS) else self.dir_buscar * self.paso_buscar
+        d = -err / self.slope if (self.slope and abs(self.slope) > SLOPE_MIN_ABS) \
+            else self.dir_buscar * self.paso_buscar
         d = clamp(d, -PASO_BUSCAR_MAX, PASO_BUSCAR_MAX)
         cambio = self._mover_fase(d)
         return self._r(f"BUSCAR φ{d:+.1f}°", cambio_fase=cambio, fresh=True)
 
     def _pll(self, fresh, stats):
         if fresh:
-            s = self.slope if (self.slope and abs(self.slope) > SLOPE_MIN_ABS) else SLOPE_INIT
+            s = self.slope if (self.slope and abs(self.slope) > SLOPE_MIN_ABS) \
+                else SLOPE_INIT
             err = self.error_fresh
-            
+
             if abs(err) > PHI_TRIM_DEADBAND and self.cooldown_trim == 0:
                 d = clamp(-err / s, -PHI_TRIM_MAX, PHI_TRIM_MAX)
                 if abs(d) > PHI_TRIM_MIN:
                     self._mover_fase(d)
                     stats.registrar_trim(d)
                     self.cooldown_trim = N_FRESH_COOLDOWN_TRIM
-                    return self._r(f"PLL-trim φ{d:+.1f}°", cambio_fase=True, fresh=True)
-                    
+                    return self._r(f"PLL-trim φ{d:+.1f}°",
+                                   cambio_fase=True, fresh=True)
+
             eff_dt = max(min(self.dt_since_fresh, EFF_DT_MAX), 0.05)
             err_int = -err / s
-            self.df_integral = clamp(self.df_integral + KI_PLL * err_int * eff_dt, -DF_MAX, DF_MAX)
+            self.df_integral = clamp(
+                self.df_integral + KI_PLL * err_int * eff_dt,
+                -DF_MAX, DF_MAX)
             df_out = KP_PLL * err_int + self.df_integral
-            self.delta_f = clamp((1 - DF_LP) * self.delta_f + DF_LP * df_out, -DF_MAX, DF_MAX)
+            self.delta_f = clamp((1 - DF_LP) * self.delta_f + DF_LP * df_out,
+                                 -DF_MAX, DF_MAX)
         return self._r(f"PLL df={self.delta_f:+.5f}", fresh=fresh)
 
 
@@ -286,6 +319,14 @@ def main():
     print("=" * 78)
     print(f" CONTROL FP v11.10 — Objetivo FP={FP_OBJETIVO} (φ_obj={PHI_OBJETIVO:.2f}°)")
     print("=" * 78)
+
+    # -------- Pregunta inicial de estadísticas (una sola llamada) --------
+    stats_robustas = solicitar_estadisticas(
+        fp_target=FP_OBJETIVO,
+        tolerancia=TOL_OBJETIVO,
+        tolerancia_fina=TOL_FINA,
+    )
+
     fg = wt = None
     ctrl = ControladorFP()
     stats = Stats()
@@ -299,9 +340,11 @@ def main():
         wt.conectar()
         fg.extreme(canal=1, frecuencia_hz=FREC_NOMINAL, amplitud_vpp=AMPLITUD_FG,
                    offset_v=OFFSET_V_FG, fase_grados=0.0, encender_salida=True)
-        wt.extreme(elemento_entrada=ELEMENTO_WT, incluir_potencias=True, configurar_salida=True)
-        
-        print(f"\n{'t (s)':>6} | {'FP Medido':>10} | {'|FP-0.2|':>10} | {'Modo':>7} | {'Acción':>20}")
+        wt.extreme(elemento_entrada=ELEMENTO_WT, incluir_potencias=True,
+                   configurar_salida=True)
+
+        print(f"\n{'t (s)':>6} | {'FP Medido':>10} | {'|FP-0.2|':>10} | "
+              f"{'Modo':>7} | {'Acción':>20}")
         print("-" * 65)
 
         t_ctrl = t_prev = time.time()
@@ -309,18 +352,23 @@ def main():
             t_now = time.time()
             dt = t_now - t_prev
             t_prev = t_now
+            t_rel = t_now - t_ctrl
             try:
                 m = wt.leer_mediciones_minimas()
             except Exception:
                 time.sleep(INTERVALO_MUESTREO)
                 continue
-            if wt.is_outlier(): continue
-            fp_med, phi_med, f_med = m.get("factor_potencia"), m.get("angulo_fase"), m.get("frecuencia")
+            if wt.is_outlier():
+                continue
+            fp_med = m.get("factor_potencia")
+            phi_med = m.get("angulo_fase")
+            f_med = m.get("frecuencia")
             if phi_med is None or f_med is None:
                 time.sleep(INTERVALO_MUESTREO)
                 continue
-            
-            fp_abs = abs(fp_med) if fp_med is not None else abs(np.cos(np.radians(phi_med)))
+
+            fp_abs = abs(fp_med) if fp_med is not None \
+                else abs(np.cos(np.radians(phi_med)))
             total += 1
             res = ctrl.actualizar(fp_med, phi_med, dt, stats)
 
@@ -330,18 +378,57 @@ def main():
 
             stats.registrar(fp_abs, res["error_fase"], res["modo"], dt)
 
-            print(f"{int(t_now - t_ctrl):>6} | {fp_abs:>10.4f} | {abs(fp_abs - FP_OBJETICO):>10.4f} | {res['modo']:>7} | {res['accion']:>20}")
+            # -------- Único envío de datos al módulo de estadísticas --------
+            if stats_robustas is not None:
+                stats_robustas.agregar(
+                    t_rel, fp_abs,
+                    res.get("error_fase", 0.0),
+                    modo=res["modo"],
+                )
+
+            print(f"{int(t_rel):>6} | {fp_abs:>10.4f} | "
+                  f"{abs(fp_abs - FP_OBJETICO):>10.4f} | "
+                  f"{res['modo']:>7} | {res['accion']:>20}")
 
             elapsed = time.time() - t_now
             if elapsed < INTERVALO_MUESTREO:
                 time.sleep(INTERVALO_MUESTREO - elapsed)
 
+        # -------- Fin normal --------
         stats.resumen(ctrl)
+
     except KeyboardInterrupt:
-        if total > 0 and t_ctrl is not None: stats.resumen(ctrl)
+        print("\n\n[!] Detenido por usuario (Ctrl+C).")
+        if total > 0 and t_ctrl is not None:
+            try:
+                stats.resumen(ctrl)
+            except Exception as e:
+                print(f"[!] Error en resumen: {e}")
+
+    except Exception as e:
+        print(f"\n[X] Error fatal: {e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            stats.resumen(ctrl)
+        except Exception as e2:
+            print(f"[!] Además falló resumen: {e2}")
+
     finally:
-        if fg: fg.desconectar()
-        if wt: wt.desconectar()
+        # -------- Único punto de cierre del módulo de estadísticas --------
+        finalizar_seguro(stats_robustas)
+
+        print("\n[!] Apagando...")
+        if fg:
+            try: fg.establecer_salida(1, False)
+            except Exception: pass
+            try: fg.desconectar()
+            except Exception: pass
+        if wt:
+            try: wt.desconectar()
+            except Exception: pass
+        print("[✓] Listo.")
+
 
 if __name__ == "__main__":
     main()

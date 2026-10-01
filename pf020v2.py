@@ -1,4 +1,5 @@
-"""CONTROL DE FP v11.0-0.2 — Compacto, enfocado en alcanzar FP=0.2"""
+"""CONTROL DE FP v11.2 — Objetivo FP=0.1 (φ=84.26°)
+   Mejoras: trim 2-velocidades, bias integral rápido, PLL afinado."""
 import time
 import numpy as np
 from controllers.fg420controller import YokogawaFG420
@@ -10,33 +11,50 @@ ELEMENTO_WT = 1
 TIEMPO_PRUEBA_SEG = 300
 INTERVALO_MUESTREO = 0.05
 
-PHI_OBJETIVO = 78.46
-FP_OBJETIVO  = 0.2
-FP_MIN_RANGO, FP_MAX_RANGO  = 0.17, 0.23
-FP_TIGHT_LOW, FP_TIGHT_HIGH = 0.19, 0.21
+# --- Objetivo FP=0.1 ---
+PHI_OBJETIVO = 84.26
+FP_OBJETIVO  = 0.1
+FP_MIN_RANGO, FP_MAX_RANGO  = 0.06, 0.14
+FP_TIGHT_LOW, FP_TIGHT_HIGH = 0.09, 0.11
 PHI_TIGHT = 0.58
 
 AMPLITUD_FG, OFFSET_V_FG = 5.0, 0.0
 FASE_MIN, FASE_MAX = -180.0, 180.0
 FREC_NOMINAL = 60.0
 
-PHI_BUSCAR_ENTER, PHI_BUSCAR_EXIT = 50.0, 15.0
-N_FRESH_ENTER_BUSCAR, N_FRESH_EXIT_BUSCAR = 3, 2
-PASO_BUSCAR_INICIAL, PASO_BUSCAR_MIN, PASO_BUSCAR_MAX = 20.0, 8.0, 30.0
-N_SETTLE_BUSCAR = 20
+# --- BUSCAR: re-entrar antes ---
+PHI_BUSCAR_ENTER, PHI_BUSCAR_EXIT = 15.0, 8.0
+N_FRESH_ENTER_BUSCAR, N_FRESH_EXIT_BUSCAR = 2, 2
+PASO_BUSCAR_INICIAL, PASO_BUSCAR_MIN, PASO_BUSCAR_MAX = 20.0, 6.0, 30.0
+N_SETTLE_BUSCAR = 15
 
-KP_PLL, KI_PLL = 0.008, 0.0010
-DF_MAX, DF_LP  = 0.15, 0.45
+# --- PLL más rápido ---
+KP_PLL, KI_PLL = 0.018, 0.0015
+DF_MAX, DF_LP  = 0.15, 0.50
 
-STALE_TOL, STALE_FORCE_SEC = 0.15, 0.6
+STALE_TOL, STALE_FORCE_SEC = 0.20, 0.6
 EFF_DT_MAX, SLOPE_SETTLE_SEC = 1.5, 0.30
 MAX_OUTLIERS_CONSEC = 5
 
-PHI_TRIM_DEADBAND, PHI_TRIM_MAX, PHI_TRIM_MIN = 3.0, 12.0, 0.5
+# --- Trim: deadband fino, dos velocidades ---
+PHI_TRIM_DEADBAND = 0.6
+PHI_TRIM_MAX = 5.0
+PHI_TRIM_MIN = 0.15
+TRIM_GAIN_FINE = 0.70        # cuando |err| < 2°
+TRIM_GAIN_COARSE = 0.95      # cuando |err| >= 2°
+TRIM_COARSE_UMBRAL = 2.0
 N_FRESH_COOLDOWN_TRIM = 3
 
+# --- Integral de bias: rápida ---
+KI_BIAS = 0.20
+PHI_BIAS_MAX = 2.0
+
+# --- Escape por FP ---
+FP_ESCAPE = 0.035
+N_FRESH_ESCAPE = 3
+
 CALIB_PASO = 6.0
-SLOPE_INIT, SLOPE_MIN_ABS, SLOPE_SAMPLES_INIT = -0.7, 0.20, 20
+SLOPE_INIT, SLOPE_MIN_ABS, SLOPE_SAMPLES_INIT = -0.60, 0.20, 20
 OUTLIER_JUMP = 35.0
 MIN_FRESH_SINCE_LAST = 15.0
 DELTA_MIN_MOVER = 0.2
@@ -47,9 +65,9 @@ def error_fase(phi_deg): return envolver_fase(phi_deg - PHI_OBJETIVO)
 def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 
-# ==================== ESTADÍSTICAS (foco FP=0.2) ====================
+# ==================== ESTADÍSTICAS (foco FP=0.1) ====================
 class Stats:
-    BANDS = [0.01, 0.02, 0.03, 0.05]      # tolerancias |FP - 0.2|
+    BANDS = [0.005, 0.01, 0.02, 0.04]
 
     def __init__(self):
         self.fp_hist, self.fp_err_hist, self.phi_err_hist = [], [], []
@@ -80,7 +98,6 @@ class Stats:
                 self.t_in_band[b] += dt
                 if self.t_first_band[b] is None:
                     self.t_first_band[b] = self.t_total
-        # Racha en banda tight
         if FP_TIGHT_LOW <= fp_abs <= FP_TIGHT_HIGH:
             self.run_tight_cur += dt
             self.run_tight_max = max(self.run_tight_max, self.run_tight_cur)
@@ -88,7 +105,6 @@ class Stats:
             if self.run_tight_cur > 0:
                 self.runs_tight.append(self.run_tight_cur)
                 self.run_tight_cur = 0.0
-        # Zero-crossings del error (indicador de oscilación)
         s = 1 if phi_err > 0 else (-1 if phi_err < 0 else 0)
         if s != 0 and self.prev_sign != 0 and s != self.prev_sign:
             self.n_zerocross += 1
@@ -103,7 +119,7 @@ class Stats:
         if self.run_tight_cur > 0:
             self.runs_tight.append(self.run_tight_cur)
         print("\n" + "=" * 78)
-        print(f" RESUMEN FINAL v11.0 — Objetivo FP={FP_OBJETIVO}")
+        print(f" RESUMEN FINAL v11.2 — Objetivo FP={FP_OBJETIVO} (φ={PHI_OBJETIVO:.2f}°)")
         print("=" * 78)
 
         print(f"\n[ Datos ]  T={self.t_total:.1f}s  N={self.n_total}  "
@@ -113,18 +129,18 @@ class Stats:
         if self.fp_hist:
             print(f"[ FP ]     media={np.mean(self.fp_hist):.4f}  "
                   f"std={np.std(self.fp_hist):.4f}  "
-                  f"|FP-0.2| med={np.median(self.fp_err_hist):.4f}  "
+                  f"|FP-0.1| med={np.median(self.fp_err_hist):.4f}  "
                   f"p90={np.percentile(self.fp_err_hist, 90):.4f}")
         if self.phi_err_hist:
             print(f"[ φ err ]  |Δφ| media={np.mean(self.phi_err_hist):.2f}°  "
                   f"mediana={np.median(self.phi_err_hist):.2f}°")
 
-        print(f"\n[ Tiempo en banda |FP-0.2| ]")
+        print(f"\n[ Tiempo en banda |FP-0.1| ]")
         for b in self.BANDS:
             pct = 100 * self.t_in_band[b] / max(self.t_total, 1e-6)
             t1 = self.t_first_band[b]
             t1_str = f"{t1:6.1f}s" if t1 is not None else "  --  "
-            print(f"  ±{b:.2f}   {pct:5.1f}%  1er: {t1_str}   "
+            print(f"  ±{b:.3f}  {pct:5.1f}%  1er: {t1_str}   "
                   f"{'#' * int(pct / 2)}")
 
         med_tight = np.median(self.runs_tight) if self.runs_tight else 0.0
@@ -137,14 +153,15 @@ class Stats:
 
         slope_str = f"{ctrl.slope:+.3f} ({ctrl.slope_samples})" if ctrl.slope else "N/A"
         print(f"\n[ Control ]  trims={self.n_trims}  "
-              f"zerocross={self.n_zerocross}  slope={slope_str}")
+              f"zerocross={self.n_zerocross}  slope={slope_str}  "
+              f"bias={ctrl.phi_bias:+.2f}°")
         if self.trims_phi_delta:
             print(f"[ Trims ]   |Δφ| medio={np.mean(self.trims_phi_delta):.2f}°  "
                   f"máx={np.max(self.trims_phi_delta):.2f}°")
 
         if self.fp_hist:
             print(f"\n[ Distribución |FP| ]")
-            edges = [0.0, 0.14, 0.16, 0.18, 0.19, 0.20, 0.21, 0.22, 0.24, 0.30, 1.01]
+            edges = [0.0, 0.05, 0.07, 0.08, 0.09, 0.10, 0.11, 0.12, 0.14, 0.20, 1.01]
             counts = np.zeros(len(edges) - 1, dtype=int)
             for fp in self.fp_hist:
                 for i in range(len(edges) - 1):
@@ -158,15 +175,15 @@ class Stats:
                 print(f"  [{edges[i]:.2f}-{edges[i+1]:.2f})  "
                       f"{counts[i]:5d} ({pct:5.1f}%)  {'#' * int(pct / 2)}")
 
-        pct_t = 100 * self.t_in_band[0.02] / max(self.t_total, 1e-6)
-        pct_l = 100 * self.t_in_band[0.05] / max(self.t_total, 1e-6)
+        pct_t = 100 * self.t_in_band[0.01] / max(self.t_total, 1e-6)
+        pct_l = 100 * self.t_in_band[0.04] / max(self.t_total, 1e-6)
         v = ("EXCELENTE" if pct_t >= 70 else "BUENO"     if pct_t >= 50 else
              "ACEPTABLE" if pct_l >= 50 else "POBRE"     if pct_l >= 25 else "FALLO")
-        print(f"\n[ Veredicto ]  {v}   (±0.02: {pct_t:.1f}% | ±0.05: {pct_l:.1f}%)")
+        print(f"\n[ Veredicto ]  {v}   (±0.01: {pct_t:.1f}% | ±0.04: {pct_l:.1f}%)")
         print("=" * 78)
 
 
-# ==================== CONTROLADOR v10.6 (compacto) ====================
+# ==================== CONTROLADOR v11.2 ====================
 class ControladorFP:
     def __init__(self):
         self.fase_cmd = 0.0
@@ -196,6 +213,8 @@ class ControladorFP:
         self.move_time = 0.0
         self.last_fresh_time = time.time()
         self.n_outliers_consec = 0
+        self.phi_bias = 0.0
+        self.fp_escape_count = 0
 
     def _r(self, accion, cambio_fase=False, fresh=False):
         return {"accion": accion, "fase": self.fase_cmd, "delta_f": self.delta_f,
@@ -282,6 +301,7 @@ class ControladorFP:
         self.fresh_after_move = False
         self.fresh_enter_buscar = 0
         self.fresh_exit_buscar = 0
+        self.fp_escape_count = 0
 
     def actualizar(self, fp, phi_med, dt, stats):
         if phi_med is None:
@@ -294,12 +314,21 @@ class ControladorFP:
         if fresh and abs(self.error_fresh) < self.mejor_phi_abs:
             self.mejor_phi_abs = abs(self.error_fresh)
         self._slope()
+
         if fresh:
             self.fresh_enter_buscar = (self.fresh_enter_buscar + 1
                 if abs(self.error_fresh) > PHI_BUSCAR_ENTER else 0)
             self.fresh_exit_buscar = (self.fresh_exit_buscar + 1
                 if abs(self.error_fresh) < PHI_BUSCAR_EXIT else 0)
-        if self.modo == "PLL" and self.fresh_enter_buscar >= N_FRESH_ENTER_BUSCAR:
+            if fp is not None:
+                fp_err = abs(abs(fp) - FP_OBJETIVO)
+                if fp_err > FP_ESCAPE:
+                    self.fp_escape_count += 1
+                else:
+                    self.fp_escape_count = 0
+
+        if self.modo == "PLL" and (self.fresh_enter_buscar >= N_FRESH_ENTER_BUSCAR
+                                    or self.fp_escape_count >= N_FRESH_ESCAPE):
             self._cambiar("BUSCAR")
         elif self.modo == "BUSCAR" and self.fresh_exit_buscar >= N_FRESH_EXIT_BUSCAR:
             self._cambiar("PLL")
@@ -330,16 +359,35 @@ class ControladorFP:
             s = self.slope if (self.slope and abs(self.slope) > SLOPE_MIN_ABS) else SLOPE_INIT
             err = self.error_fresh
             self.fresh_since_trim += 1
-            if (abs(err) > PHI_TRIM_DEADBAND
-                    and self.fresh_since_trim >= N_FRESH_COOLDOWN_TRIM):
-                d = clamp(-err / s, -PHI_TRIM_MAX, PHI_TRIM_MAX)
+            eff_dt = max(min(self.dt_since_fresh, EFF_DT_MAX), 0.05)
+
+            # === Bias integral: acumula cualquier residual dentro del deadband ===
+            if 0.1 < abs(err) < PHI_TRIM_DEADBAND and self.fresh_since_trim > 1:
+                self.phi_bias = clamp(
+                    self.phi_bias + KI_BIAS * err * eff_dt,
+                    -PHI_BIAS_MAX, PHI_BIAS_MAX)
+            else:
+                self.phi_bias *= 0.95
+
+            err_eff = err + self.phi_bias
+
+            # === Trim de dos velocidades ===
+            grande = abs(err) >= TRIM_COARSE_UMBRAL
+            min_muestras = 1 if grande else N_FRESH_COOLDOWN_TRIM
+            ganancia = TRIM_GAIN_COARSE if grande else TRIM_GAIN_FINE
+
+            if (abs(err_eff) > PHI_TRIM_DEADBAND
+                    and self.fresh_since_trim >= min_muestras):
+                d = clamp(-ganancia * err / s, -PHI_TRIM_MAX, PHI_TRIM_MAX)
                 if abs(d) > PHI_TRIM_MIN:
                     self._mover_fase(d)
                     self.fresh_since_trim = 0
+                    self.phi_bias = 0.0
                     stats.registrar_trim(d)
                     return self._r(f"PLL-trim φ{d:+.1f}°",
                                    cambio_fase=True, fresh=True)
-            eff_dt = max(min(self.dt_since_fresh, EFF_DT_MAX), 0.05)
+
+            # === PLL frecuencia ===
             err_int = -err / s
             self.df_integral = clamp(
                 self.df_integral + KI_PLL * err_int * eff_dt, -DF_MAX, DF_MAX)
@@ -363,7 +411,7 @@ def print_row(t, fp_abs, res):
 # ==================== MAIN ====================
 def main():
     print("=" * 78)
-    print(f" CONTROL FP v11.0 — Objetivo FP={FP_OBJETIVO} (φ_obj={PHI_OBJETIVO:.2f}°)")
+    print(f" CONTROL FP v11.2 — Objetivo FP={FP_OBJETIVO} (φ_obj={PHI_OBJETIVO:.2f}°)")
     print("=" * 78)
 
     fg = wt = None

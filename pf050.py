@@ -1,4 +1,5 @@
 """CONTROL DE FP v10.2 - PLL hacia FP=0.5 con trim, calibración y red de seguridad"""
+#Se deja como version definitiva
 import time
 import numpy as np
 from controllers.fg420controller import YokogawaFG420

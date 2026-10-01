@@ -1,734 +1,314 @@
 """
-CONTROL DE FP v10.0 - PLL con objetivo FP = 0.01 (PHI = ±89.427°)
-=================================================================
-
-⚠⚠⚠  ADVERTENCIA EXTREMA  ⚠⚠⚠
-
-FP = 0.01 significa PHI = ±89.427°, es decir 0.573° del vértice ±90°
-donde P = 0. La potencia activa es 1% de la aparente. En esta zona:
-
-  * d(cos θ)/dθ = -sin(89.427°) ≈ -0.99995 ⇒ 1° de PHI ≈ 0.0175 de FP.
-    Es decir, para mantener |FP-0.01| < 0.005 necesitas mantener
-    |PHI-89.427| < 0.286°  → a nivel del ruido propio del instrumento.
-
-  * El WT3000 puede NO resolver el ángulo con esta estabilidad si:
-      - No está activada la compensación de fase (phase correction).
-      - El filtro de promediado es corto.
-      - La señal tiene armónicos o el FG no es perfectamente senoidal.
-      - Los cables de tensión/corriente no están apareados.
-
-  * Existe riesgo de que el control cruce el vértice 90° y el signo de
-    la potencia activa se invierta. El algoritmo está preparado para
-    volver a BUSCAR en ese caso, pero la dinámica se vuelve errática.
-
-Recomendación: si es posible, verifica primero con FP=0.1 y FP=0.05
-antes de intentar 0.01. Si esos objetivos ya son inestables, 0.01
-también lo será, independientemente del algoritmo.
-
-Cambios respecto a v9.9:
-  * Objetivo FP = 0.01 → PHI = ±89.427°
-  * Umbrales y tolerancias reescalados proporcionalmente.
-  * Ganancias PLL reducidas al mínimo.
-  * STALE_TOL reducido para no descartar variaciones finas.
-  * OUTLIER_JUMP ajustado (riesgo de rechazar movimientos legítimos).
-  * Bins del histograma a 0.005 de resolución.
+CONTROL DE FACTOR DE POTENCIA v12.15-000 (Rango Expandido & Búsqueda Antirruido)
+--------------------------------------------------------------------------------
+Objetivo: FP = 0.0100  (φ_obj ≈ 89.4271°)
+Instrumentación: Yokogawa FG420 + Yokogawa WT3000 (vía GPIB)
+--------------------------------------------------------------------------------
 """
-import time
-import numpy as np
-from collections import deque
-from controllers.fg420controller import YokogawaFG420
-from controllers.wt3000controller import YokogawaWT3000
 
-# ==============================================================================
-# CONFIGURACIÓN
-# ==============================================================================
-DIR_FG = "GPIB1::2::INSTR"
-DIR_WT = "GPIB0::1::INSTR"
+import math
+import sys
+import time
+from pathlib import Path
+import numpy as np
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+
+from controllers.fg420controllerv2 import YokogawaFG420
+from controllers.wt3000controllerv2 import YokogawaWT3000
+
+# ==================== CONFIGURACIÓN Y CONSTANTES ====================
+DIR_FG, DIR_WT = "GPIB1::2::INSTR", "GPIB0::1::INSTR"
 ELEMENTO_WT = 1
 TIEMPO_PRUEBA_SEG = 300
-INTERVALO_MUESTREO = 0.05
+INTERVALO_MUESTREO = 0.09
 
-# --- Objetivo: FP = 0.010 → PHI = ±89.427° ---
-FP_OBJETIVO = 0.010
-PHI_OBJETIVO = 89.427          # grados — cos(89.427°) = 0.010
+FP_OBJETIVO  = 0.01
+PHI_OBJETIVO = 89.4271
 
-FP_MIN_RANGO = 0.001
-FP_MAX_RANGO = 0.020
-FP_TIGHT     = 0.010
-FP_TIGHT_TOL = 0.005           # |FP - 0.01| < 0.005 → [0.005, 0.015]
-
-AMPLITUD_FG = 5.0
-OFFSET_V_FG = 0.0
-FASE_MIN, FASE_MAX = -180.0, 180.0
+AMPLITUD_FG, OFFSET_V_FG = 5.0, 0.0
+FASE_MIN, FASE_MAX = 0.0, 120.0  # Permite alcanzar 89.4271° sin chocar con topes
 FREC_NOMINAL = 60.0
 
-# BUSCAR ↔ PLL (referidos a phi_err = PHI - PHI_OBJETIVO)
-PHI_BUSCAR_ENTER = 3.0        # |phi_err| > esto → BUSCAR (3 usables)
-PHI_BUSCAR_EXIT  = 1.0        # |phi_err| < esto → PLL (2 usables)
-N_FRESH_ENTER_BUSCAR = 3
-N_FRESH_EXIT_BUSCAR  = 2
+# --- Umbrales BUSCAR <-> PLL ---
+PHI_BUSCAR_ENTER, PHI_BUSCAR_EXIT = 8.0, 2.5
+PASO_BUSCAR_DEG = 0.80
+N_SETTLE_BUSCAR = 2
+BUSCAR_TIMEOUT_SEC = 8.0
+FLIP_CONFIRM_COUNT = 4      # Confirmación estricta de 4 muestras
+FLIP_MIN_DELTA_DEG = 0.20    # Ignora ruido menor a 0.20°
 
-# BUSCAR — paso adaptativo muy fino
-PASO_BUSCAR_INICIAL   = 5.0     # barrido ciego
-PASO_BUSCAR_MAX       = 10.0    # tope absoluto
-PASO_BUSCAR_FAR       = 2.0     # paso mínimo cuando |phi_err| > umbral
-PASO_BUSCAR_NEAR      = 0.2     # paso mínimo cuando |phi_err| <= umbral
-PHI_ERR_FAR_THRESH    = 4.0     # umbral lejos/cerca (grados)
-N_SETTLE_BUSCAR = 6
+# --- Control PI / PLL ---
+KP_PHI_VEL = 0.35
+KI_PHI_VEL = 0.80
+INTEGRAL_CMD_LIMIT   = 12.00
+INTEGRAL_ENABLE_BAND = 20.00
 
-# PLL — ganancias mínimas
-KP_PLL = 0.0006
-KI_PLL = 0.00006
-DF_MAX = 0.10
-DF_LP  = 0.30
-EFF_DT_MAX = 0.6
+# --- Filtro y Tolerancias ---
+ERR_FILT_ALPHA = 0.35
+STALE_TOL, STALE_FORCE_SEC = 0.05, 0.3
+MAX_OUTLIERS_CONSEC = 5
 
-# Slope: inicialización
-SLOPE_INIT = -0.8
-SLOPE_MIN_ABS = 0.20
-SLOPE_SAMPLES_INIT = 20
+PHI_TRIM_DEADBAND = 0.06
+PHI_TRIM_MAX      = 1.20
+PHI_TRIM_MIN      = 0.02
+N_FRESH_COOLDOWN_TRIM = 4
 
-# Detección de staleness y outliers
-STALE_TOL = 0.02               # ° — más fino para no perder cambios
-OUTLIER_JUMP = 12.0            # ° — equilibrio entre rechazar y aceptar
+OUTLIER_JUMP = 30.0
+DELTA_MIN_MOVER = 0.02
 
-# --- Antídotos contra el bloqueo por stale ---
-STALE_REFRESH_LIMIT = 20
-N_MAX_WAIT_MOVE     = 25
-
-PHI_LOCKED = 0.5               # |phi_err| < 0.5° → lock
+def envolver_fase(a): return ((a + 180.0) % 360.0) - 180.0
+def error_fase(phi_deg): return envolver_fase(phi_deg - PHI_OBJETIVO)
+def clamp(v, lo, hi): return max(lo, min(hi, v))
 
 
-# ------------------------------------------------------------------------------
-# Utilidades de fase
-# ------------------------------------------------------------------------------
-def envolver_fase(a):
-    return ((a + 180.0) % 360.0) - 180.0
+# ==================== ESTADÍSTICAS AVANZADAS ====================
+class StatsAvanzadas:
+    BANDS = [0.002, 0.005, 0.010, 0.020]
 
-
-def phi_err_de(phi):
-    """Error angular respecto al objetivo PHI_OBJETIVO, en (-180, 180]."""
-    return envolver_fase(phi - PHI_OBJETIVO)
-
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-
-# ==============================================================================
-# RUNTRACKER
-# ==============================================================================
-class RunTracker:
-    def __init__(self, name=""):
-        self.name = name
-        self.current_samples = 0
-        self.current_time = 0.0
-        self.max_samples = 0
-        self.max_time = 0.0
-        self.total_in_run_samples = 0
-        self.total_in_run_time = 0.0
-        self.total_samples = 0
-        self.total_time = 0.0
-        self.run_lengths = []
-        self.run_times = []
-
-    def update(self, cond, dt):
-        self.total_samples += 1
-        self.total_time += dt
-        if cond:
-            self.current_samples += 1
-            self.current_time += dt
-            self.total_in_run_samples += 1
-            self.total_in_run_time += dt
-            if self.current_samples > self.max_samples:
-                self.max_samples = self.current_samples
-            if self.current_time > self.max_time:
-                self.max_time = self.current_time
-        else:
-            self._close_run()
-
-    def _close_run(self):
-        if self.current_samples > 0:
-            self.run_lengths.append(self.current_samples)
-            self.run_times.append(self.current_time)
-            self.current_samples = 0
-            self.current_time = 0.0
-
-    def close(self):
-        self._close_run()
-
-    def summary(self):
-        n = len(self.run_lengths)
-        pct_time = 100 * self.total_in_run_time / max(self.total_time, 1e-6)
-        if n == 0:
-            return {"n": 0, "max_time": 0.0, "max_samples": 0,
-                    "mean_time": 0.0, "median_time": 0.0,
-                    "pct_time": pct_time,
-                    "total_time_in": self.total_in_run_time}
-        return {"n": n, "max_time": self.max_time, "max_samples": self.max_samples,
-                "mean_time": float(np.mean(self.run_times)),
-                "median_time": float(np.median(self.run_times)),
-                "pct_time": pct_time,
-                "total_time_in": self.total_in_run_time}
-
-    def histogram(self, bins):
-        hist = np.zeros(len(bins) - 1, dtype=int)
-        for t in self.run_times:
-            placed = False
-            for i in range(len(bins) - 1):
-                if bins[i] <= t < bins[i + 1]:
-                    hist[i] += 1
-                    placed = True
-                    break
-            if not placed and t >= bins[-1]:
-                hist[-1] += 1
-        return hist
-
-
-# ==============================================================================
-# ESTADÍSTICAS
-# ==============================================================================
-class Estadisticas:
     def __init__(self):
-        self.fp_hist = []
-        self.phi_hist = []
-        self.fase_hist = []
-        self.frec_hist = []
-        self.df_hist = []
-        self.tiempos_modo = {"BUSCAR": 0.0, "PLL": 0.0}
-        self.bins_fp = np.zeros(10)
-        self.n_transiciones = 0
-        self.n_stale = 0
-        self.n_fresh = 0
-        self.n_outliers = 0
-        self.n_refresh_forzado = 0
+        self.fp_hist, self.phi_err_hist = [], []
+        self.times_mode = {"BUSCAR": 0.0, "PLL": 0.0}
+        self.t_total = 0.0
+        self.n_total = 0
+        self.n_fresh = self.n_stale = self.n_outliers = 0
+        
+        self.trims_phi_delta = []
+        self.flips_count = 0
+        self.t_in_band = {b: 0.0 for b in self.BANDS}
+        self.first_time_in_band = {b: None for b in self.BANDS}
 
-        self.run_fp_range = RunTracker(
-            f"FP en rango [{FP_MIN_RANGO:.3f}, {FP_MAX_RANGO:.3f}]")
-        self.run_fp_tight = RunTracker(
-            f"|FP - {FP_TIGHT:.3f}| < {FP_TIGHT_TOL:.3f}")
-        self.run_phi_lock = RunTracker(
-            f"|PHI - {PHI_OBJETIVO:.3f}°| < {PHI_LOCKED:.1f}°")
-        self.run_out = RunTracker("FP fuera rango")
-
-        self.tiempo_primer_lock = None
-        self.tiempo_primer_tight = None
-
-    def registrar(self, fp, phi, fase, frec, df, modo, dt):
+    def registrar(self, fp, phi_err, modo, dt):
+        self.t_total += dt
+        self.n_total += 1
         self.fp_hist.append(fp)
-        self.phi_hist.append(phi)
-        self.fase_hist.append(fase)
-        self.frec_hist.append(frec)
-        self.df_hist.append(df)
-        self.tiempos_modo[modo] = self.tiempos_modo.get(modo, 0.0) + dt
-        # Bins: 0.005 de resolución en |FP - objetivo|
-        idx = int(abs(abs(fp) - FP_TIGHT) / 0.005)
-        idx = min(idx, 9)
-        self.bins_fp[idx] += 1
+        fp_err = abs(fp - FP_OBJETIVO)
+        self.phi_err_hist.append(phi_err)
+        self.times_mode[modo] = self.times_mode.get(modo, 0.0) + dt
 
-        in_range = FP_MIN_RANGO <= abs(fp) <= FP_MAX_RANGO
-        self.run_fp_range.update(in_range, dt)
-        self.run_fp_tight.update(abs(abs(fp) - FP_TIGHT) < FP_TIGHT_TOL, dt)
-        self.run_phi_lock.update(abs(phi_err_de(phi)) < PHI_LOCKED, dt)
-        self.run_out.update(not in_range, dt)
+        for b in self.BANDS:
+            if fp_err <= b:
+                self.t_in_band[b] += dt
+                if self.first_time_in_band[b] is None:
+                    self.first_time_in_band[b] = self.t_total
 
-    def cerrar_rachas(self):
-        self.run_fp_range.close()
-        self.run_fp_tight.close()
-        self.run_phi_lock.close()
-        self.run_out.close()
+    def registrar_trim(self, dphi):
+        self.trims_phi_delta.append(dphi)
 
-    def _imprimir_rachas(self, tracker, bins):
-        s = tracker.summary()
-        print(f"\n  ▸ {tracker.name}")
-        print(f"      Nº rachas:           {s['n']}")
-        if s["n"] > 0:
-            print(f"      Racha más larga:     {s['max_time']:.2f} s "
-                  f"({s['max_samples']} muestras)")
-            print(f"      Duración media:      {s['mean_time']:.2f} s")
-            print(f"      Duración mediana:    {s['median_time']:.2f} s")
-        print(f"      Tiempo total:        {s['total_time_in']:.1f} s "
-              f"({s['pct_time']:.1f}%)")
-        if s["n"] > 0 and tracker.run_times:
-            hist = tracker.histogram(bins)
-            print(f"      Distribución:")
-            for i in range(len(bins) - 1):
-                lo, hi = bins[i], bins[i + 1]
-                if hi == np.inf:
-                    label = f"      >{lo:>6.1f}s"
-                elif lo == 0:
-                    label = f"      <{hi:>6.1f}s"
-                else:
-                    label = f"   {lo:>5.1f}-{hi:<5.1f}s"
-                n = hist[i]
-                barra = "#" * min(n, 40)
-                print(f"        {label} : {n:3d}  {barra}")
-
-    def resumen(self, controlador, t_total, n_iter, en_rango):
-        self.cerrar_rachas()
-        print("\n" + "=" * 90)
-        print(f" RESUMEN FINAL v10.0 — OBJETIVO FP = {FP_OBJETIVO:.3f} "
-              f"(PHI = {PHI_OBJETIVO:.3f}°)  [ZONA CRÍTICA]")
-        print("=" * 90)
-
-        print(f"\n[ Tiempo y muestras ]")
-        print(f"  Tiempo total:            {t_total:.1f} s")
-        print(f"  Iteraciones:             {n_iter}")
-        print(f"  Tasa efectiva:           {n_iter/max(t_total,1e-6):.1f} muestras/s")
-        print(f"  Lecturas frescas:        {self.n_fresh}")
-        print(f"  Lecturas stale:          {self.n_stale}")
-        print(f"  Refrescos forzados:      {self.n_refresh_forzado}")
-        print(f"  Outliers rechazados:     {self.n_outliers}")
+    def resumen(self, ctrl):
+        print("\n" + "=" * 78)
+        print(f" RESUMEN DE DIAGNÓSTICO v12.15-000 — Objetivo FP={FP_OBJETIVO}")
+        print("=" * 78)
+        print(f"[ Datos Base ]  T={self.t_total:.1f}s  N={self.n_total}  frescas={self.n_fresh}  stale={self.n_stale}  outliers={self.n_outliers}")
+        
         if self.fp_hist:
-            print(f"  FP promedio:             {np.mean(self.fp_hist):.5f}")
-            print(f"  FP desviación:           {np.std(self.fp_hist):.5f}")
-            print(f"  |FP - 0.01| promedio:    "
-                  f"{np.mean(np.abs(np.array(self.fp_hist) - FP_TIGHT)):.5f}")
-        if self.phi_hist:
-            print(f"  |PHI - PHI_obj| prom:    "
-                  f"{np.mean([abs(phi_err_de(p)) for p in self.phi_hist]):.3f}°")
-            print(f"  |PHI - PHI_obj| mediana: "
-                  f"{np.median([abs(phi_err_de(p)) for p in self.phi_hist]):.3f}°")
+            fp_arr = np.array(self.fp_hist)
+            media_fp, std_fp = np.mean(fp_arr), np.std(fp_arr)
+            mediana_err = np.median(np.abs(fp_arr - FP_OBJETIVO))
+            print(f"[ Control FP ]  media={media_fp:.4f}  std={std_fp:.4f}  sesgo={media_fp - FP_OBJETIVO:+.4f}  |FP-0.01| med={mediana_err:.4f}")
 
-        if n_iter > 0:
-            ef = 100 * en_rango / n_iter
-            print(f"\n[ Efectividad ]")
-            print(f"  En rango [{FP_MIN_RANGO:.3f}, {FP_MAX_RANGO:.3f}]:  "
-                  f"{en_rango} ({ef:.1f}%)")
+        print(f"[ Distribución Modos ] BUSCAR={self.times_mode.get('BUSCAR',0):.1f}s ({(self.times_mode.get('BUSCAR',0)/max(self.t_total,0.1))*100:.1f}%) | PLL={self.times_mode.get('PLL',0):.1f}s ({(self.times_mode.get('PLL',0)/max(self.t_total,0.1))*100:.1f}%)")
+        print(f"[ Inversiones Búsqueda ] Flips confirmados: {self.flips_count}")
 
-        print(f"\n[ Tiempo por modo ]")
-        tot = sum(self.tiempos_modo.values()) or 1.0
-        for m, t in self.tiempos_modo.items():
-            pct = 100 * t / tot
-            barra = "#" * int(pct / 2)
-            print(f"  {m:<10} {t:7.1f}s ({pct:5.1f}%)  {barra}")
+        print("[ Tiempo en Banda FP ]")
+        for b in self.BANDS:
+            pct = (self.t_in_band[b] / max(self.t_total, 0.1)) * 100
+            t_1st = f"{self.first_time_in_band[b]:.1f}s" if self.first_time_in_band[b] is not None else "--"
+            bar = "#" * int(pct / 4)
+            print(f"   ±{b:.3f} : {pct:5.1f}%   1er: {t_1st:>5s}   {bar}")
 
-        n_tot = self.bins_fp.sum()
-        if n_tot > 0:
-            print(f"\n[ Distribución de |FP - {FP_TIGHT:.3f}| ]")
-            for i in range(9, -1, -1):
-                pct = 100 * self.bins_fp[i] / n_tot
-                barra = "#" * int(pct / 2)
-                lo = i * 0.005
-                print(f"  [{lo:.3f}-{lo+0.005:.3f}] {int(self.bins_fp[i]):5d} "
-                      f"({pct:5.1f}%)  {barra}")
+        n_trims = len(self.trims_phi_delta)
+        mean_trim = np.mean(np.abs(self.trims_phi_delta)) if n_trims > 0 else 0.0
 
-        print(f"\n[ Rachas de permanencia ]")
-        bins_t = [0, 0.5, 2.0, 5.0, 15.0, 30.0, 60.0, np.inf]
-        self._imprimir_rachas(self.run_fp_range, bins_t)
-        self._imprimir_rachas(self.run_fp_tight, bins_t)
-        self._imprimir_rachas(self.run_phi_lock, bins_t)
-        self._imprimir_rachas(self.run_out, bins_t)
-
-        print(f"\n[ Trazabilidad ]")
-        print(f"  Mejor FP:                {controlador.mejor_fp:.5f}")
-        print(f"  Mejor |PHI - PHI_obj|:   {controlador.mejor_phi_abs:.3f}°")
-        print(f"  Fase en mejor punto:     {controlador.mejor_fase:+.3f}°")
-        if self.tiempo_primer_lock is not None:
-            print(f"  1er lock (|PHI-obj|<{PHI_LOCKED:.1f}°): "
-                  f"{self.tiempo_primer_lock:.2f} s")
-        if self.tiempo_primer_tight is not None:
-            print(f"  1er |FP-0.01|<{FP_TIGHT_TOL:.3f}: "
-                  f"{self.tiempo_primer_tight:.2f} s")
-
-        print(f"\n[ PLL ]")
-        print(f"  Kp = {KP_PLL:.5f}  Ki = {KI_PLL:.6f}  |Δf|max = {DF_MAX:.3f} Hz")
-        if self.df_hist:
-            print(f"  Δf promedio:             {np.mean(self.df_hist):+.5f} Hz")
-            print(f"  Δf desviación:           {np.std(self.df_hist):.5f} Hz")
-            print(f"  Δf máximo abs:           {np.max(np.abs(self.df_hist)):.5f} Hz")
-        print(f"  Cambios de fase:         {controlador.n_cambios_fase}")
-        print(f"  Transiciones BUSCAR↔PLL: {self.n_transiciones}")
-        if controlador.slope is not None:
-            print(f"  Slope (dPHI/dφ):         {controlador.slope:+.3f} "
-                  f"({controlador.slope_samples} act.)")
-
-        if self.frec_hist:
-            uf = self.frec_hist[-100:] if len(self.frec_hist) >= 100 else self.frec_hist
-            print(f"\n[ Frecuencia de red medida ]")
-            print(f"  Promedio (últimas):      {np.mean(uf):.4f} Hz")
-            print(f"  Desviación:              {np.std(uf):.5f} Hz")
-            print(f"  Rango global:            {np.min(self.frec_hist):.4f} - "
-                  f"{np.max(self.frec_hist):.4f} Hz")
-
-        print(f"\n[ Veredicto ]")
-        if n_iter > 0:
-            ef = 100 * en_rango / n_iter
-            if ef >= 80:
-                print(f"  EXCELENTE ({ef:.1f}% en rango)")
-            elif ef >= 50:
-                print(f"  ACEPTABLE ({ef:.1f}% en rango)")
-            elif ef >= 20:
-                print(f"  POBRE ({ef:.1f}% en rango)")
-            else:
-                print(f"  FALLO ({ef:.1f}% en rango)")
-        print("=" * 90)
+        print(f"[ Estado Interno ]")
+        print(f"   Trims Aplicados: n={n_trims} | |Δφ| promedio={mean_trim:.2f}°")
+        print(f"   Pendiente Nominal: s={ctrl.slope:+.3f}")
+        print(f"   Integrador Acumulado: integral_cmd={ctrl.integral_cmd:+.3f}°")
+        print(f"   Comando Fase Final: fase_cmd={ctrl.fase_cmd:.3f}°")
+        print("=" * 78)
 
 
-# ==============================================================================
-# CONTROLADOR v10.0
-# ==============================================================================
-class ControladorFPv9:
+# ==================== CONTROLADOR OPTIMIZADO ====================
+class ControladorFP:
     def __init__(self):
-        # Actuadores
-        self.fase_cmd = 0.0
-        self.delta_f = 0.0
-        self.df_integral = 0.0
-
-        # Estado
+        self.fase_cmd = 85.0  # Punto inicial cercano a 89.4271°
         self.modo = "BUSCAR"
         self.cnt = 0
         self.move_pending = False
-        self.fresh_after_move = False
-
-        # PHI fresco
         self.phi_prev_raw = None
         self.phi_fresh = 0.0
+        self.error_fresh = error_fase(85.0)
+        self.error_filt  = error_fase(85.0)
         self.phi_stale = True
-        self.stale_run = 0
+        
+        self.slope = -0.50
+        self.last_fresh_time = time.time()
+        self.n_outliers_consec = 0
+        self.cooldown_trim = 0
+        self.integral_cmd = 0.0
 
-        # Slope
-        self.slope = SLOPE_INIT
-        self.slope_samples = SLOPE_SAMPLES_INIT
-        self.fase_prev = None
-        self.phi_prev = None
+        # BUSCAR con antirruido
+        self.buscar_dir = 1
+        self.buscar_prev_err_abs = None
+        self.buscar_start_time = time.time()
+        self.bad_steps_count = 0
 
-        # Búsqueda (informativo; el paso real se calcula en _buscar)
-        self.paso_buscar = PASO_BUSCAR_INICIAL
-        self.dir_buscar = +1.0
-
-        # Contadores
-        self.n_cambios_fase = 0
-        self.dt_since_fresh = 0.0
-        self.n_refresh_forzado = 0
-
-        # Histéresis BUSCAR↔PLL
-        self.fresh_enter_buscar = 0
-        self.fresh_exit_buscar = 0
-
-        # Mejor histórico (distancia mínima al objetivo)
-        self.mejor_phi_abs = 180.0
-        self.mejor_fase = 0.0
-        self.mejor_fp = 0.0
-
-    # ------------------------------------------------------------------
-    def _resp(self, accion, f_fg, cambio_fase=False, fresh=False):
-        return {
-            "accion": accion,
-            "fase": self.fase_cmd,
-            "delta_f": self.delta_f,
-            "frecuencia": f_fg,
-            "cambio_fase": cambio_fase,
-            "modo": self.modo,
-            "phi": self.phi_fresh,
-            "phi_err": phi_err_de(self.phi_fresh),
-            "fresh": fresh,
-            "stale": self.phi_stale,
-            "mejor_fp": self.mejor_fp,
-            "mejor_fase": self.mejor_fase,
-            "mejor_phi_abs": self.mejor_phi_abs,
-            "slope": self.slope if self.slope is not None else 0.0,
-            "paso": self.paso_buscar,
-        }
+    def _r(self, accion, cambio_fase=False, fresh=False):
+        return {"accion": accion, "fase": self.fase_cmd,
+                "cambio_fase": cambio_fase, "modo": self.modo,
+                "phi": self.phi_fresh, "error_fase": self.error_fresh,
+                "fresh": fresh, "stale": self.phi_stale}
 
     def _mover_fase(self, delta):
-        if abs(delta) < 0.1:  # umbral bajado para FP=0.01
-            return False
-        self.fase_prev = self.fase_cmd
-        self.phi_prev = self.phi_fresh
-        self.fase_cmd = envolver_fase(self.fase_cmd + delta)
-        self.fase_cmd = clamp(self.fase_cmd, FASE_MIN, FASE_MAX)
-        self.n_cambios_fase += 1
+        if abs(delta) < DELTA_MIN_MOVER: return False
+        self.fase_cmd = clamp(self.fase_cmd + delta, FASE_MIN, FASE_MAX)
         self.move_pending = True
-        self.fresh_after_move = False
         self.cnt = 0
         return True
 
-    # ------------------------------------------------------------------
-    def _actualizar_phi(self, phi_raw_deg, stats=None):
-        """Devuelve True si la lectura se considera fresca y utilizable."""
-        phi_w = envolver_fase(phi_raw_deg)
-
+    def _phi(self, phi_raw, stats):
+        phi_w = envolver_fase(phi_raw)
+        now = time.time()
         if self.phi_prev_raw is None:
-            self.phi_fresh = phi_w
+            self.phi_fresh, self.error_fresh = phi_w, error_fase(phi_w)
+            self.error_filt = self.error_fresh
             self.phi_prev_raw = phi_w
             self.phi_stale = False
-            self.stale_run = 0
+            self.last_fresh_time = now
             return True
 
-        changed = abs(phi_w - self.phi_prev_raw) >= STALE_TOL
-
-        if not changed:
-            self.stale_run += 1
-            self.phi_stale = True
-
-            if (not self.move_pending) and (self.stale_run >= STALE_REFRESH_LIMIT):
-                self.phi_fresh = phi_w
+        step_prev = abs(envolver_fase(phi_w - self.phi_prev_raw))
+        if step_prev > OUTLIER_JUMP:
+            stats.n_outliers += 1
+            self.n_outliers_consec += 1
+            if self.n_outliers_consec < MAX_OUTLIERS_CONSEC:
                 self.phi_prev_raw = phi_w
                 self.phi_stale = False
-                self.stale_run = 0
-                self.n_refresh_forzado += 1
-                if stats is not None:
-                    stats.n_refresh_forzado += 1
-                return True
+                return False
+        else:
+            self.n_outliers_consec = 0
 
-            if self.move_pending and (self.stale_run >= N_MAX_WAIT_MOVE):
-                self.phi_fresh = phi_w
-                self.phi_prev_raw = phi_w
-                self.move_pending = False
-                self.fresh_after_move = False
-                self.phi_stale = False
-                self.stale_run = 0
-                self.n_refresh_forzado += 1
-                if stats is not None:
-                    stats.n_refresh_forzado += 1
-                return True
-
-            return False
-
-        # Valor distinto: candidato fresco. Comprobamos outlier.
-        jump = abs(envolver_fase(phi_w - self.phi_fresh))
-        if jump > OUTLIER_JUMP:
-            if stats is not None:
-                stats.n_outliers += 1
-            self.phi_prev_raw = phi_w
-            self.phi_stale = False
-            return False
-
-        # Aceptado
-        self.phi_fresh = phi_w
         self.phi_prev_raw = phi_w
+        step_fresh = abs(envolver_fase(phi_w - self.phi_fresh))
+        force_fresh = (now - self.last_fresh_time) > STALE_FORCE_SEC
+        
+        if step_fresh < STALE_TOL and not force_fresh:
+            self.phi_stale = True
+            return False
+
+        self.phi_fresh, self.error_fresh = phi_w, error_fase(phi_w)
+        self.error_filt = ERR_FILT_ALPHA * self.error_fresh + (1 - ERR_FILT_ALPHA) * self.error_filt
         self.phi_stale = False
-        self.stale_run = 0
-        if self.move_pending:
-            self.fresh_after_move = True
+        self.last_fresh_time = now
         return True
 
-    def _actualizar_slope(self):
-        if not self.move_pending or not self.fresh_after_move:
-            return
-        if self.fase_prev is None or self.phi_prev is None:
-            self.move_pending = False
-            return
-        dphi = envolver_fase(self.phi_fresh - self.phi_prev)
-        dfase = envolver_fase(self.fase_cmd - self.fase_prev)
-        if abs(dfase) < 0.3 or abs(dphi) < 0.1:
-            self.move_pending = False
-            return
-        slope_new = dphi / dfase
-        if abs(slope_new) > 5.0 or abs(slope_new) < 0.05:
-            self.move_pending = False
-            return
-        if self.slope is None:
-            self.slope = slope_new
-            self.slope_samples = 1
-        else:
-            w = max(1.0 / (self.slope_samples + 1), 0.15)
-            self.slope = (1 - w) * self.slope + w * slope_new
-            self.slope_samples += 1
-        self.move_pending = False
-
-    def _cambiar_modo(self, nuevo, stats):
-        if nuevo == self.modo:
-            return
-        self.modo = nuevo
+    def _cambiar(self, modo):
+        if modo == self.modo: return
+        self.modo = modo
         self.cnt = 0
         self.move_pending = False
-        self.fresh_after_move = False
-        self.fresh_enter_buscar = 0
-        self.fresh_exit_buscar = 0
-        if stats is not None:
-            stats.n_transiciones += 1
 
-    # ------------------------------------------------------------------
-    def actualizar(self, fp_med, phi_med, f_med, dt, stats=None):
-        if phi_med is None:
-            return self._resp("SIN_PHI", FREC_NOMINAL + self.delta_f)
+        if modo == "BUSCAR":
+            self.buscar_prev_err_abs = None
+            self.buscar_start_time = time.time()
+            self.bad_steps_count = 0
+        elif modo == "PLL":
+            self.error_filt = self.error_fresh
 
-        fresh = self._actualizar_phi(phi_med, stats)
+    def actualizar(self, fp, phi_med, dt, stats):
+        if phi_med is None: return self._r("SIN_PHI")
+        fresh = self._phi(phi_med, stats)
         self.cnt += 1
-        self.dt_since_fresh += dt
-        if fresh:
-            self.dt_since_fresh = 0.0
-            if stats is not None:
-                stats.n_fresh += 1
-        elif stats is not None:
-            stats.n_stale += 1
+        stats.n_fresh += 1 if fresh else 0
+        stats.n_stale += 0 if fresh else 1
 
-        fp_abs = abs(fp_med) if fp_med is not None \
-            else abs(np.cos(np.radians(self.phi_fresh)))
+        if fresh: self.cooldown_trim = max(0, self.cooldown_trim - 1)
 
-        phi_err = phi_err_de(self.phi_fresh)
+        if self.modo == "PLL" and abs(self.error_fresh) > PHI_BUSCAR_ENTER:
+            self._cambiar("BUSCAR")
+        elif self.modo == "BUSCAR" and abs(self.error_fresh) < PHI_BUSCAR_EXIT:
+            self._cambiar("PLL")
 
-        if fresh and abs(phi_err) < self.mejor_phi_abs:
-            self.mejor_phi_abs = abs(phi_err)
-            self.mejor_fase = self.fase_cmd
-            self.mejor_fp = fp_abs
+        return self._buscar(fresh, stats) if self.modo == "BUSCAR" else self._pll(fresh, dt, stats)
 
-        self._actualizar_slope()
+    def _buscar(self, fresh, stats):
+        if not fresh: return self._r("BUSCAR-stale")
 
-        # --- Histéresis BUSCAR↔PLL ---
-        usable = fresh or ((not self.move_pending) and self.stale_run == 0)
-        if usable:
-            if abs(phi_err) > PHI_BUSCAR_ENTER:
-                self.fresh_enter_buscar += 1
-            else:
-                self.fresh_enter_buscar = 0
+        if time.time() - self.buscar_start_time > BUSCAR_TIMEOUT_SEC:
+            self._cambiar("PLL")
+            return self._r("BUSCAR-timeout → PLL")
 
-            if abs(phi_err) < PHI_BUSCAR_EXIT:
-                self.fresh_exit_buscar += 1
-            else:
-                self.fresh_exit_buscar = 0
+        if self.cnt < N_SETTLE_BUSCAR: return self._r("BUSCAR-settle")
 
-        if self.modo == "PLL" and self.fresh_enter_buscar >= N_FRESH_ENTER_BUSCAR:
-            self._cambiar_modo("BUSCAR", stats)
-        elif self.modo == "BUSCAR" and self.fresh_exit_buscar >= N_FRESH_EXIT_BUSCAR:
-            self._cambiar_modo("PLL", stats)
+        err = abs(self.error_fresh)
 
-        # --- Ejecución ---
-        if self.modo == "BUSCAR":
-            return self._buscar(fresh)
+        if self.buscar_prev_err_abs is None:
+            self.buscar_prev_err_abs = err
+            d = self.buscar_dir * PASO_BUSCAR_DEG
+            cambio = self._mover_fase(d)
+            return self._r(f"BUSCAR φ{d:+.1f}° (init)", cambio_fase=cambio, fresh=True)
+
+        delta_err = err - self.buscar_prev_err_abs
+
+        if delta_err > FLIP_MIN_DELTA_DEG:
+            self.bad_steps_count += 1
+            if self.bad_steps_count >= FLIP_CONFIRM_COUNT:
+                self.buscar_dir *= -1
+                self.bad_steps_count = 0
+                stats.flips_count += 1
         else:
-            return self._pll(fresh)
+            self.bad_steps_count = 0
 
-    # ------------------------------------------------------------------
-    def _buscar(self, fresh):
-        if self.cnt < N_SETTLE_BUSCAR:
-            return self._resp("BUSCAR-settle", FREC_NOMINAL + self.delta_f)
+        self.buscar_prev_err_abs = err
+        d = self.buscar_dir * PASO_BUSCAR_DEG
+        cambio = self._mover_fase(d)
+        return self._r(f"BUSCAR φ{d:+.1f}°", cambio_fase=cambio, fresh=True)
 
-        if self.move_pending and not self.fresh_after_move:
-            return self._resp("BUSCAR-espera", FREC_NOMINAL + self.delta_f)
+    def _pll(self, fresh, dt, stats):
+        if not fresh:
+            return self._r(f"PLL ef={self.error_filt:+.2f}°", fresh=False)
 
-        self.delta_f = 0.0
+        err_f = self.error_filt
+        s = self.slope if abs(self.slope) > 0.05 else -0.50
+        e = -err_f / s
 
-        phi_err = phi_err_de(self.phi_fresh)
+        if abs(err_f) < INTEGRAL_ENABLE_BAND:
+            self.integral_cmd = clamp(
+                self.integral_cmd + KI_PHI_VEL * e * dt, 
+                -INTEGRAL_CMD_LIMIT, 
+                INTEGRAL_CMD_LIMIT
+            )
 
-        if self.slope is not None and abs(self.slope) > SLOPE_MIN_ABS:
-            delta = -phi_err / self.slope
+        dP = KP_PHI_VEL * e
+        d = clamp(dP + self.integral_cmd, -PHI_TRIM_MAX, PHI_TRIM_MAX)
 
-            if abs(phi_err) > PHI_ERR_FAR_THRESH:
-                paso_min = PASO_BUSCAR_FAR
-            else:
-                paso_min = PASO_BUSCAR_NEAR
+        if abs(err_f) > PHI_TRIM_DEADBAND and self.cooldown_trim == 0:
+            if abs(d) > PHI_TRIM_MIN:
+                self._mover_fase(d)
+                stats.registrar_trim(d)
+                self.cooldown_trim = N_FRESH_COOLDOWN_TRIM
+                return self._r(f"PLL φ{d:+.2f}°", cambio_fase=True, fresh=True)
 
-            delta = np.sign(delta) * max(abs(delta), paso_min)
-        else:
-            delta = self.dir_buscar * PASO_BUSCAR_INICIAL
-
-        delta = clamp(delta, -PASO_BUSCAR_MAX, PASO_BUSCAR_MAX)
-
-        self.paso_buscar = abs(delta)
-
-        cambio = self._mover_fase(delta)
-        return self._resp(f"BUSCAR φ{delta:+.2f}°",
-                          FREC_NOMINAL, cambio_fase=cambio, fresh=fresh)
-
-    # ------------------------------------------------------------------
-    def _pll(self, fresh):
-        """PLL: Δf = Kp·err + Ki·∫err, con err = -phi_err/slope."""
-        if fresh:
-            eff_dt = min(self.dt_since_fresh, EFF_DT_MAX)
-            if eff_dt < 0.05:
-                eff_dt = 0.05
-
-            s = self.slope if (self.slope is not None
-                               and abs(self.slope) > SLOPE_MIN_ABS) else SLOPE_INIT
-            phi_err = phi_err_de(self.phi_fresh)
-            err = -phi_err / s
-
-            self.df_integral += KI_PLL * err * eff_dt
-            self.df_integral = clamp(self.df_integral, -DF_MAX, DF_MAX)
-            df_p = clamp(KP_PLL * err, -DF_MAX, DF_MAX)
-            df_out = df_p + self.df_integral
-            self.delta_f = (1 - DF_LP) * self.delta_f + DF_LP * df_out
-            self.delta_f = clamp(self.delta_f, -DF_MAX, DF_MAX)
-
-        f_fg = FREC_NOMINAL + self.delta_f
-        return self._resp(f"PLL df={self.delta_f:+.5f}", f_fg, fresh=fresh)
+        return self._r(f"PLL ef={self.error_filt:+.2f}° (I={self.integral_cmd:+.2f})", fresh=True)
 
 
-# ==============================================================================
-# LOGGING
-# ==============================================================================
-def encabezado():
-    print("-" * 170)
-    print(f"{'t':>4} | {'FP':>7} | {'PHI':>9} | {'*':>1} | {'Fase':>8} | "
-          f"{'Δf':>10} | {'FrecFG':>9} | {'Modo':>7} | {'Slope':>7} | "
-          f"{'dfint':>10} | {'phi_err':>9} | {'MejorFP':>7} | {'Acción':>18}")
-    print("-" * 170)
-
-
-def fila(t, fp_med, res, en_rango, df_integral=0.0, err_val=0.0):
-    mark = "*" if res.get("fresh") else ("-" if res.get("stale") else " ")
-    print(f"{t:>4} | {fp_med:>7.4f} | {res['phi']:>+9.3f} | {mark:>1} | "
-          f"{res['fase']:>+8.3f} | {res['delta_f']:>+10.5f} | "
-          f"{res['frecuencia']:>9.4f} | {res['modo']:>7} | "
-          f"{res['slope']:>+7.3f} | {df_integral:>+10.5f} | "
-          f"{err_val:>+9.3f} | {res['mejor_fp']:>7.4f} | {res['accion']:>18}")
-
-
-# ==============================================================================
-# MAIN
-# ==============================================================================
+# ==================== MAIN ====================
 def main():
-    print("=" * 170)
-    print(f" CONTROL FP v10.0 — OBJETIVO FP = {FP_OBJETIVO:.3f} "
-          f"(PHI = {PHI_OBJETIVO:.3f}°)  [ZONA CRÍTICA · 0.573° del vértice]")
-    print("=" * 170)
-    print(f" Muestreo objetivo: {1/INTERVALO_MUESTREO:.0f} Hz")
-    print(f" Kp = {KP_PLL:.5f}  Ki = {KI_PLL:.6f}  |Δf|max = {DF_MAX:.3f} Hz")
-    print(f" BUSCAR entra si |PHI-obj| > {PHI_BUSCAR_ENTER}° (3 usables); "
-          f"sale si |PHI-obj| < {PHI_BUSCAR_EXIT}° (2 usables)")
-    print(f" Slope inicializado en {SLOPE_INIT}. Outliers: saltos > {OUTLIER_JUMP}°")
-    print(f" Anti-bloqueo: refresco forzado a los {STALE_REFRESH_LIMIT} stales; "
-          f"timeout move a los {N_MAX_WAIT_MOVE}")
-    print(f" Paso BUSCAR adaptativo: far(>{PHI_ERR_FAR_THRESH}°)={PASO_BUSCAR_FAR}° "
-          f"near={PASO_BUSCAR_NEAR}° max={PASO_BUSCAR_MAX}°")
-    print(f" ⚠⚠⚠  FP=0.01 está a sólo {90.0 - PHI_OBJETIVO:.3f}° del vértice. "
-          f"Requiere compensación de fase del WT y muy bajo ruido.")
-    print("=" * 170)
-
-    fg = None
-    wt = None
-    controlador = ControladorFPv9()
-    stats = Estadisticas()
-
-    total = 0
-    en_rango = 0
-    t_ctrl = None
+    fg = wt = None
+    ctrl = ControladorFP()
+    stats = StatsAvanzadas()
 
     try:
-        print("\n[1/3] Conectando equipos (modo EXTREME)...")
         fg = YokogawaFG420(DIR_FG, mode='extreme')
         wt = YokogawaWT3000(DIR_WT, mode='extreme')
         fg.conectar()
         wt.conectar()
-        print(f"  FG420:  {fg.obtener_idn()[:60]}")
-        print(f"  WT3000: {wt.obtener_idn()[:60]}")
 
-        fg.extreme(
-            canal=1, frecuencia_hz=FREC_NOMINAL,
-            amplitud_vpp=AMPLITUD_FG, offset_v=OFFSET_V_FG,
-            fase_grados=0.0, encender_salida=True,
-        )
-        wt.extreme(
-            elemento_entrada=ELEMENTO_WT,
-            incluir_potencias=True, configurar_salida=True,
-        )
-        print("  Modo EXTREME aplicado.")
+        fg.extreme(canal=1, frecuencia_hz=FREC_NOMINAL, amplitud_vpp=AMPLITUD_FG,
+                   offset_v=OFFSET_V_FG, fase_grados=ctrl.fase_cmd, encender_salida=True)
+        wt.extreme(elemento_entrada=ELEMENTO_WT, incluir_potencias=True, configurar_salida=True)
 
-        print("\n[2/3] Estabilizando 5 s...")
-        for _ in range(10):
-            time.sleep(0.5)
-            print(".", end="", flush=True)
-        print(" OK")
-
-        print("\n[3/3] INICIANDO CONTROL\n")
-        encabezado()
-
-        t_ctrl = time.time()
-        t_prev = t_ctrl
-
+        t_ctrl = t_prev = time.time()
         while time.time() - t_ctrl < TIEMPO_PRUEBA_SEG:
             t_now = time.time()
             dt = t_now - t_prev
@@ -736,83 +316,34 @@ def main():
 
             try:
                 m = wt.leer_mediciones_minimas()
-            except Exception as e:
-                print(f"[X] Error lectura: {e}")
+            except Exception:
                 time.sleep(INTERVALO_MUESTREO)
                 continue
 
-            if wt.is_outlier():
-                continue
-
-            fp_med = m.get("factor_potencia")
-            phi_med = m.get("angulo_fase")
-            f_med = m.get("frecuencia")
-            if phi_med is None or f_med is None:
+            if wt.is_outlier(): continue
+            fp_med, phi_med = m.get("factor_potencia"), m.get("angulo_fase")
+            if phi_med is None:
                 time.sleep(INTERVALO_MUESTREO)
                 continue
 
-            fp_abs = abs(fp_med) if fp_med is not None \
-                else abs(np.cos(np.radians(phi_med)))
-            total += 1
-            en_rango_local = FP_MIN_RANGO <= fp_abs <= FP_MAX_RANGO
-            if en_rango_local:
-                en_rango += 1
+            fp_abs = abs(fp_med) if fp_med is not None else abs(np.cos(np.radians(phi_med)))
+            res = ctrl.actualizar(fp_abs, phi_med, dt, stats)
 
-            res = controlador.actualizar(fp_med, phi_med, f_med, dt, stats)
-
-            fg.establecer_frecuencia_extreme(1, res["frecuencia"])
             if res["cambio_fase"]:
                 fg.establecer_fase(1, res["fase"])
 
-            stats.registrar(fp_abs, res["phi"], res["fase"],
-                            res["frecuencia"], res["delta_f"],
-                            res["modo"], dt)
-
-            t_rel = t_now - t_ctrl
-            phi_err = phi_err_de(res["phi"])
-            if stats.tiempo_primer_lock is None and abs(phi_err) < PHI_LOCKED:
-                stats.tiempo_primer_lock = t_rel
-            if (stats.tiempo_primer_tight is None
-                    and abs(fp_abs - FP_TIGHT) < FP_TIGHT_TOL):
-                stats.tiempo_primer_tight = t_rel
-
-            if res.get("fresh") or total % 8 == 0:
-                s = controlador.slope if controlador.slope else SLOPE_INIT
-                err_val = -phi_err / s if abs(s) > SLOPE_MIN_ABS else 0.0
-                fila(int(t_rel), fp_abs, res, en_rango_local,
-                     controlador.df_integral, err_val)
+            stats.registrar(fp_abs, res["error_fase"], res["modo"], dt)
 
             elapsed = time.time() - t_now
             if elapsed < INTERVALO_MUESTREO:
                 time.sleep(INTERVALO_MUESTREO - elapsed)
 
-        stats.resumen(controlador, time.time() - t_ctrl, total, en_rango)
-
+        stats.resumen(ctrl)
     except KeyboardInterrupt:
-        print("\n\n[!] Detenido por usuario.")
-        if total > 0 and t_ctrl is not None:
-            stats.resumen(controlador, time.time() - t_ctrl, total, en_rango)
-
-    except Exception as e:
-        print(f"\n[X] Error fatal: {e}")
-        import traceback
-        traceback.print_exc()
-
+        stats.resumen(ctrl)
     finally:
-        print("\n[!] Apagando...")
-        if fg is not None:
-            try:
-                fg.establecer_salida(1, False)
-                fg.desconectar()
-            except Exception:
-                pass
-        if wt is not None:
-            try:
-                wt.desconectar()
-            except Exception:
-                pass
-        print("[✓] Listo.")
-
+        if fg: fg.desconectar()
+        if wt: wt.desconectar()
 
 if __name__ == "__main__":
     main()
