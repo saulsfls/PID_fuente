@@ -1,33 +1,3 @@
-"""
-main.py — GUI principal v11.31.0
-=========================================================================
-Interfaz gráfica que:
-  * Permite seleccionar el FACTOR DE POTENCIA objetivo (menu + combobox).
-  * Permite seleccionar la REFERENCIA (Voltaje/Corriente) con un TOGGLE
-    estilo Bootstrap form-switch en el panel principal.
-  * Controla la TENSIÓN del FG (Vrms) con flechas ↑/↓ y campo editable.
-  * Muestra el PF medido en grande + LED de estado + consola + stats.
-  * Apagado SEGURO y ROBUSTO del FG.
-  * NUEVO: Integración con el módulo de ESTADÍSTICAS ROBUSTAS del PF.
-
-NOVEDADES v11.31.0
-------------------
-  * Integración del módulo `estadisticas_robustas`:
-      - Pregunta al usuario (messagebox) si desea recopilar estadísticas.
-      - Alimenta muestras (t, fp, phi, modo) al objeto EstadisticasRobustas.
-      - Al finalizar, imprime el reporte en la consola y pregunta si guardar
-        el Excel (misma funcionalidad que la versión CLI, pero sin bloquear
-        el hilo de Tk).
-  * Slider de REFERENCIA reemplazado por un ToggleSwitch con la misma
-    apariencia que un `<input type="checkbox" role="switch">` de Bootstrap.
-    Texto y lógica se mantienen: VOLTAJE (FU) ← → CORRIENTE (FI).
-
-NOVEDADES v11.30.1 (heredadas)
-------------------------------
-  * FIX CRÍTICO: las flechas ↑/↓ dejaban de funcionar para el voltaje
-    después de modificar el paso.
-  * PASO_VRMS_DEFAULT = 0.0001.
-"""
 import io
 import math
 import threading
@@ -35,6 +5,7 @@ import sys
 import time
 from pathlib import Path
 import traceback
+from config import Configuracion
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 import tkinter as tk
@@ -82,18 +53,15 @@ DEFAULT_ALG = next(iter(ALGORITMOS_DISPONIBLES))
 # ==============================================================================
 # IMPORT ROBUSTO DEL MÓDULO DE ESTADÍSTICAS ROBUSTAS
 # ==============================================================================
-# Se intenta importar con varios nombres posibles (según cómo se haya
-# guardado el archivo del módulo). Si no se encuentra, la GUI sigue
-# funcionando, simplemente sin recopilar estadísticas.
 EstadisticasRobustas = None
 STATS_OK = False
 _STATS_ERR = ""
 
 for _stats_mod_name in (
-    "estadisticas_robustas",
-    "estadisticas",
-    "stats_robustas",
-    "stats_pf",
+    "module.estadisticas_robustas",
+    "module.estadisticas",
+    "module.stats_robustas",
+    "module.stats_pf",
 ):
     try:
         _stats_mod = __import__(_stats_mod_name, fromlist=["EstadisticasRobustas"])
@@ -316,7 +284,11 @@ class MainApp:
         self._vcmd_voltaje = (self.root.register(self._validar_entry_voltaje), "%P")
         self._vcmd_paso    = (self.root.register(self._validar_entry_paso), "%P")
 
-        self._build_menubar()
+        # --- Menú + UI ---
+        self._build_menubar()                      # crea Archivo/Direcciones/PF + guarda Ayuda
+        self.config = Configuracion(self, self.menubar)
+        self.config.instalar_menu()                # agrega "Configuración"
+        self.menubar.add_cascade(label="Ayuda", menu=self.menu_ayuda)  # Ayuda al final
         self._build_ui()
         self._bind_keys()
         self._refresh_algorithm_ui()
@@ -353,18 +325,40 @@ class MainApp:
 
         self._set_led("desconocido")
 
+        # Cargar parámetros persistidos del algoritmo por defecto (si hay)
+        try:
+            self.config.cargar_params_algoritmo()
+        except Exception:
+            pass
+
+        # Cargar parámetros de arranque persistidos (voltaje inicial + paso)
+        try:
+            self.config.cargar_arranque()
+        except Exception:
+            pass
+
     # ==================================================================
     # MENÚ
     # ==================================================================
     def _build_menubar(self):
+        """
+        Construye Archivo / Direcciones / Factor de Potencia y prepara
+        el menú de Ayuda en self.menu_ayuda SIN agregarlo todavía. El
+        __init__ agrega "Configuración" (vía config.instalar_menu()) y
+        DESPUÉS agrega "Ayuda", logrando el orden:
+
+            Archivo | Direcciones | Factor de Potencia | Configuración | Ayuda
+        """
         self.menubar = tk.Menu(self.root)
 
+        # --- Archivo ---
         m_archivo = tk.Menu(self.menubar, tearoff=0)
         m_archivo.add_command(label="Limpiar consola", command=self._limpiar)
         m_archivo.add_separator()
         m_archivo.add_command(label="Salir", command=self.root.quit)
         self.menubar.add_cascade(label="Archivo", menu=m_archivo)
 
+        # --- Direcciones ---
         self.menu_dir = tk.Menu(self.menubar, tearoff=0)
         self.menu_dir.add_command(label="Modificar direcciones...",
                                    command=self._open_address_dialog)
@@ -375,6 +369,7 @@ class MainApp:
                                    command=self._conectar_instrumentos)
         self.menubar.add_cascade(label="Direcciones", menu=self.menu_dir)
 
+        # --- Factor de Potencia ---
         self.menu_pf = tk.Menu(self.menubar, tearoff=0)
         for nombre in ALGORITMOS_DISPONIBLES.keys():
             self.menu_pf.add_radiobutton(
@@ -383,9 +378,11 @@ class MainApp:
             )
         self.menubar.add_cascade(label="Factor de Potencia", menu=self.menu_pf)
 
-        m_ayuda = tk.Menu(self.menubar, tearoff=0)
-        m_ayuda.add_command(label="Acerca de...", command=self._about)
-        self.menubar.add_cascade(label="Ayuda", menu=m_ayuda)
+        # --- Ayuda: se construye pero NO se agrega aún ---
+        # (el __init__ lo agrega DESPUÉS de que config.instalar_menu()
+        #  haya insertado "Configuración", para que quede al final)
+        self.menu_ayuda = tk.Menu(self.menubar, tearoff=0)
+        self.menu_ayuda.add_command(label="Acerca de...", command=self._about)
 
         self.root.config(menu=self.menubar)
 
@@ -417,6 +414,10 @@ class MainApp:
         self.algoritmo = ALGORITMOS_DISPONIBLES[nuevo](
             log_cb=self._log_threadsafe, ref_source=self.ref_source,
         )
+        try:
+            self.config.cargar_params_algoritmo()
+        except Exception:
+            pass
         try:
             self.combo_alg.set(nuevo)
         except Exception:
@@ -1451,6 +1452,57 @@ class MainApp:
         if self.running:
             return
 
+        # ==============================================================
+        # AVISO DE SEGURIDAD — CIRCUITO DE ALTA TENSIÓN (HV)
+        # ==============================================================
+        # Se muestra ANTES de tocar el FG, el algoritmo o cualquier
+        # instrumento. El usuario DEBE confirmar que revisó el voltaje
+        # inicial. Si cancela, la prueba no arranca y no se envía nada
+        # a los equipos.
+        # ==============================================================
+        v_ini_previsto = self._clamp_vrms(self.voltaje_vrms,
+                                          contexto="aviso de seguridad")
+        paso_previsto  = self._get_paso_vrms()
+
+        try:
+            confirmar = messagebox.askyesno(
+                "⚠  ADVERTENCIA — CIRCUITO DE ALTA TENSIÓN",
+                "  AVISO DE SEGURIDAD — CIRCUITO HV\n"
+                "─────────────────────────────────────────────\n\n"
+                "  Antes de continuar, verifique FÍSICAMENTE:\n\n"
+                f"    • Voltaje inicial configurado : "
+                f"{v_ini_previsto:.{VOLTAJE_VRMS_DECIMALES}f} Vrms\n"
+                f"    • Paso de levantamiento       : "
+                f"{paso_previsto:.{VOLTAJE_VRMS_DECIMALES}f} Vrms\n\n"
+                "    • Que el circuito HV esté despejado y sin\n"
+                "      personal manipulando conexiones.\n"
+                "    • Que las protecciones y descargadores estén\n"
+                "      correctamente en su lugar.\n"
+                "    • Que el área esté señalizada y bajo control.\n\n"
+                "  ¿El voltaje inicial es el CORRECTO y desea\n"
+                "  INICIAR la prueba?",
+                parent=self.root,
+                icon="warning",
+                default="no",
+            )
+        except Exception:
+            confirmar = False
+
+        if not confirmar:
+            self._log("[seguridad] Prueba CANCELADA por el usuario "
+                      "en el aviso de alta tensión.")
+            self.status.config(
+                text="  ⚠ Prueba cancelada por el usuario (aviso HV).")
+            return
+
+        self._log("=" * 110)
+        self._log("[seguridad] Aviso HV aceptado — iniciando prueba.")
+        self._log(f"[seguridad] V inicial confirmado: "
+                  f"{v_ini_previsto:.{VOLTAJE_VRMS_DECIMALES}f} Vrms · "
+                  f"paso {paso_previsto:.{VOLTAJE_VRMS_DECIMALES}f} Vrms")
+        self._log("=" * 110)
+
+        # ---------- Resto del arranque original ----------
         val = int(round(float(self.var_ref.get())))
         self.ref_source = REF_CURRENT if val == REF_SLIDER_CURRENT else REF_VOLTAGE
         try:
